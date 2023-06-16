@@ -1,5 +1,6 @@
 import copy
 import dataclasses
+from collections import defaultdict
 from typing import Dict, Any, NamedTuple, Tuple, Callable, Optional
 
 import gymnasium as gym
@@ -7,10 +8,9 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 from torch.distributions import Distribution
+from torch.nn import functional as F
 
-from . import abstract, network, data
-from .abstract import AlgoWorkerInterface
-from .data import ActType
+from . import abstract, network, data, utils
 
 
 @dataclasses.dataclass
@@ -27,6 +27,8 @@ class Config:
     actor_num_updates: int = 10
     critic_num_updates: int = 10
     experience_max_size: int = 1000
+    actor_batch_size: int = -1
+    critic_batch_size: int = -1
 
     @classmethod
     def from_env(cls, env: gym.Env, **kwargs) -> "Config":
@@ -60,7 +62,7 @@ class PolicyGradientExperienceReplay(abstract.ExperienceReplayInterface[int]):
         self,
         max_len: int,
         observation_shape: Tuple[int],
-        action_dtype: ActType,
+        action_dtype: data.ActType,
         gae_lmbda: float,
         gae_gamma: float,
     ):
@@ -140,7 +142,7 @@ class PolicyGradient(abstract.AlgoLearnerInterface[int]):
             ppo_config.gae_lambda,
         )
 
-    def get_worker(self, params: Optional[Dict[str, Any]] = None) -> AlgoWorkerInterface[ActType]:
+    def get_worker(self, params: Optional[Dict[str, Any]] = None) -> abstract.AlgoWorkerInterface[data.ActType]:
         worker_network = self.actor_building_fn()
         worker_network.load_state_dict(copy.deepcopy(self.actor.state_dict()))
         return StochasticPolicyWorker(worker_network)
@@ -149,7 +151,11 @@ class PolicyGradient(abstract.AlgoLearnerInterface[int]):
         distr = self.actor(batch.inputs)
         log_probs = distr.log_prob(batch.actions)
         loss = -torch.mean(log_probs * batch.advantages)
-        return {"actor_loss": loss, "entropy": distr.entropy()}
+        return {
+            "actor_loss": loss,
+            "entropy": distr.entropy().mean().item(),
+            "kld": (batch.old_log_probs - log_probs).mean().item(),
+        }
 
     def incorporate_experience_buffer(self, buffer: data.ExperienceBuffer) -> None:
         xs = torch.stack(buffer.observations + [buffer.observations_next[-1]], dim=0)
@@ -157,9 +163,14 @@ class PolicyGradient(abstract.AlgoLearnerInterface[int]):
         term_flags = torch.tensor(buffer.termination_flags, dtype=torch.float)
         actions = torch.tensor([act.action for act in buffer.actions], dtype=torch.int)
         log_probs = torch.tensor([act.log_prob for act in buffer.actions], dtype=torch.float)
-        returns = data.discount_rewards(rewards, term_flags, self.cfg.discount_factor_gamma)
-        advantages = data.normalize(returns)
-        self.experience_replay.incorporate(xs[:-1], actions, log_probs, returns, advantages)
+        adv_estimation = data.discount_rewards(rewards, term_flags, self.cfg.discount_factor_gamma)
+        self.experience_replay.incorporate(
+            xs[:-1],
+            actions,
+            log_probs,
+            adv_estimation.returns,
+            adv_estimation.advantages,
+        )
 
     def fit(self) -> Dict[str, float]:
         self.actor.train()
@@ -173,70 +184,107 @@ class PolicyGradient(abstract.AlgoLearnerInterface[int]):
         return {k: torch.mean(v).item() for k, v in result.items()}
 
 
-# class PPO:
-#
-#     def __init__(
-#         self,
-#         actor: network.Actor,
-#         critic: network.Critic,
-#         actor_optimizer: torch.optim.Optimizer,
-#         critic_optimizer: torch.optim.Optimizer,
-#         ppo_config: Config,
-#     ):
-#         self.cfg = ppo_config
-#         self.actor = actor
-#         self.critic = critic
-#         self.actor_optimizer = actor_optimizer
-#         self.critic_optimizer = critic_optimizer
-#
-#     def sample(self, state: Tensor) -> data.Action:
-#         self.actor.eval()
-#         with torch.inference_mode():
-#             distribution: Distribution = self.actor(state[None, :])
-#         return data.Action.from_distribution(distribution)
-#
-#     def loss_critic(self, batch: PPOBatch) -> Dict[str, Tensor]:
-#         values = self.critic(batch.inputs)
-#         loss = F.mse_loss(values, batch.critic_targets[:, None])
-#         return {"critic_loss": loss}
-#
-#     def loss_actor(self, batch: PPOBatch) -> Dict[str, Tensor]:
-#         policy_distr = self.actor(batch.inputs)
-#         new_log_probs = policy_distr.log_prob(batch.actions)
-#         ratio = torch.exp(new_log_probs - batch.old_log_probs)
-#         clipped_ratio = torch.clamp(ratio, 1.0 - self.cfg.clip_epsilon, 1.0 + self.cfg.clip_epsilon)
-#         surrogate = torch.min(ratio * batch.advantages, clipped_ratio * batch.advantages)
-#         entropy_bonus = self.cfg.entropy_beta * policy_distr.entropy()
-#         loss = -torch.mean(surrogate - entropy_bonus)
-#         return {"actor_loss": loss}
-#
-#     def train_epoch(
-#         self,
-#         experience_replay: ExperienceReplay,
-#         critic_batch_size: int,
-#         actor_batch_size: int,
-#     ) -> Dict[str, float]:
-#
-#         self.critic.train()
-#         critic_loss = torch.zeros(1)
-#         for ppo_batch in (experience_replay.sample(critic_batch_size) for _ in range(self.cfg.critic_num_updates)):
-#             result = self.loss_critic(ppo_batch)
-#             critic_loss += result["critic_loss"]
-#
-#         self.actor.train()
-#         actor_loss = torch.zeros(1)
-#         for ppo_batch in (experience_replay.sample(actor_batch_size) for _ in range(self.cfg.actor_num_updates)):
-#             result = self.loss_actor(ppo_batch)
-#             actor_loss += result["actor_loss"]
-#
-#         actor_loss = actor_loss / actor_batch_size
-#         self.actor_optimizer.zero_grad()
-#         actor_loss.backward()
-#         self.actor_optimizer.step()
-#
-#         critic_loss = critic_loss / critic_batch_size
-#         self.critic_optimizer.zero_grad()
-#         critic_loss.backward()
-#         self.critic_optimizer.step()
-#
-#         return {"actor_loss": actor_loss.item(), "critic_loss": critic_loss.item()}
+class PPO(abstract.AlgoLearnerInterface):
+
+    def __init__(
+        self,
+        actor_building_fn: Callable[[], network.Actor],
+        critic_building_fn: Callable[[], network.Critic],
+        actor_optimizer_building_fn: Callable[[network.Actor], torch.optim.Optimizer],
+        critic_optimizer_building_fn: Callable[[network.Critic], torch.optim.Optimizer],
+        ppo_config: Config,
+    ):
+        self.actor = actor_building_fn()
+        self.actor_optimizer = actor_optimizer_building_fn(self.actor)
+        self.actor_building_fn = actor_building_fn
+        self.critic = critic_building_fn()
+        self.critic_optimizer = critic_optimizer_building_fn(self.critic)
+        self.experience_replay = PolicyGradientExperienceReplay(
+            ppo_config.experience_max_size,
+            ppo_config.observation_space_shape,
+            ppo_config.action_space_dtype,
+            ppo_config.gae_lambda,
+            ppo_config.gae_lambda,
+        )
+        self.cfg = ppo_config
+
+    def get_worker(self, params: Optional[Dict[str, Any]] = None) -> abstract.AlgoWorkerInterface[data.ActType]:
+        worker_network = self.actor_building_fn()
+        worker_network.load_state_dict(copy.deepcopy(self.actor.state_dict()))
+        return StochasticPolicyWorker(worker_network)
+
+    def incorporate_experience_buffer(self, buffer: data.ExperienceBuffer) -> None:
+        xs = torch.stack(buffer.observations + [buffer.observations_next[-1]], dim=0)
+        rewards = torch.tensor(buffer.rewards)
+        term_flags = torch.tensor(buffer.termination_flags, dtype=torch.float)
+        actions = torch.tensor([act.action for act in buffer.actions], dtype=torch.int)
+        log_probs = torch.tensor([act.log_prob for act in buffer.actions], dtype=torch.float)
+        self.critic.eval()
+        with torch.inference_mode():
+            all_values = self.critic(xs)[..., 0]
+        advantage_estimation_result = data.generalized_advantage_estimation(
+            rewards,
+            all_values[:-1],
+            all_values[1:],
+            term_flags,
+            self.cfg.gae_lambda,
+            self.cfg.discount_factor_gamma,
+        )
+        self.experience_replay.incorporate(
+            xs[:-1],
+            actions,
+            log_probs,
+            advantage_estimation_result.returns,
+            advantage_estimation_result.advantages,
+        )
+
+    def loss_critic(self, batch: PPOBatch) -> Dict[str, Tensor]:
+        values = self.critic(batch.inputs)
+        loss = F.mse_loss(values, batch.critic_targets[:, None])
+        return {
+            "critic_loss": loss,
+            "critic_metrics": {
+                "value": values.mean().item(),
+            }}
+
+    def loss_actor(self, batch: PPOBatch) -> Dict[str, Tensor]:
+        policy_distr = self.actor(batch.inputs)
+        new_log_probs = policy_distr.log_prob(batch.actions)
+        prob_ratio = torch.exp(new_log_probs - batch.old_log_probs)
+        clip_adv = torch.clamp(prob_ratio, 1-self.cfg.clip_epsilon, 1+self.cfg.clip_epsilon) * batch.advantages
+
+        surrogate = -(torch.min(prob_ratio * batch.advantages, clip_adv)).mean()
+
+        return {
+            "actor_loss": surrogate,
+            "actor_metrics": {
+                "entropy": policy_distr.entropy().mean().item(),
+                "kld": (batch.old_log_probs - new_log_probs).mean().item(),
+            }}
+
+    def fit(self) -> Dict[str, float]:
+        self.critic.train()
+        metrics = []
+        for i in range(self.cfg.critic_num_updates):
+            batch = self.experience_replay.get_learning_batch(self.cfg.critic_batch_size)
+            result = self.loss_critic(batch)
+            self.critic_optimizer.zero_grad()
+            result["critic_loss"].backward()
+            self.critic_optimizer.step()
+            critic_metrics = {"critic": result["critic_loss"].detach().item()}
+            critic_metrics.update(result["critic_metrics"])
+            metrics.append(critic_metrics)
+
+        self.actor.train()
+        for i in range(self.cfg.actor_num_updates):
+            batch = self.experience_replay.get_learning_batch(self.cfg.actor_batch_size)
+            result = self.loss_actor(batch)
+            self.actor_optimizer.zero_grad()
+            result["actor_loss"].backward()
+            self.actor_optimizer.step()
+            actor_metrics = {"actor": result["actor_loss"].detach().item()}
+            actor_metrics.update(result["actor_metrics"])
+            metrics.append(actor_metrics)
+
+        self.experience_replay.reset()
+        return utils.average_dict_of_floats(metrics)

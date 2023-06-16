@@ -1,4 +1,4 @@
-from typing import TypeVar, Generic, Protocol, List, Callable
+from typing import TypeVar, Generic, List, Callable
 
 from torch import nn
 from torch import Tensor
@@ -57,11 +57,11 @@ class FFCritic(Critic):
 
     def __init__(self, in_features: int, hiddens: List[int]):
         super().__init__()
-        layers = [nn.Linear(in_features, hiddens[0]), nn.LeakyReLU()]
+        layers = [nn.Linear(in_features, hiddens[0]), nn.Tanh()]
         h1 = hiddens[0]
         for h0, h1 in zip(hiddens[:-1], hiddens[1:]):
-            layers.extend([nn.BatchNorm1d(h0), nn.Linear(h0, h1), nn.LeakyReLU()])
-        layers.extend([nn.BatchNorm1d(h1), nn.Linear(h1, 1)])
+            layers.extend([nn.BatchNorm1d(h0), nn.Linear(h0, h1), nn.Tanh()])
+        layers.extend([nn.Linear(h1, 1)])
         self.layers = nn.Sequential(*layers)
 
     def forward(self, inputs: Tensor) -> Tensor:

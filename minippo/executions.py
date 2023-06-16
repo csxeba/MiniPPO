@@ -8,7 +8,7 @@ import torch
 from gymnasium import Env
 import torch.multiprocessing as mp
 
-from . import abstract, data, roll
+from . import abstract, data, roll, utils
 
 
 class WorkerReport(NamedTuple):
@@ -64,7 +64,8 @@ def train_sync(
     num_epochs: int,
     smoothing_window_size: int = 10,
 ):
-    for epoch in range(num_epochs):
+    metrics_aggregator = utils.MetricAggregator()
+    for epoch in range(1, num_epochs+1):
         report = {"R": [], "steps": []}
         worker_reports = []
         for worker_id in range(num_workers):
@@ -75,10 +76,11 @@ def train_sync(
             ))
             algo.incorporate_experience_buffer(worker_reports[-1].buffer)
             report["R"].append(worker_reports[-1].reward_sum)
-        algo.fit()
-        print(f"\rE: {epoch:>{len(str(num_epochs))}} R: {np.mean(report['R'][-smoothing_window_size:]):.4f}", end="")
-        if epoch % smoothing_window_size == 0:
-            print()
+
+        reported_metrics = algo.fit()
+        reported_metrics["R"] = np.mean(report["R"]).item()
+        metrics_aggregator.log_metrics(reported_metrics)
+        metrics_aggregator.generate_report(epoch, num_epochs, smoothing_window_size)
 
 
 def train_async(
@@ -105,7 +107,7 @@ def train_async(
                 worker_report = WorkerReport.from_file(tmpdirname, worker_id)
                 algo.incorporate_experience_buffer(worker_report.buffer)
                 report["R"].append(worker_report.reward_sum)
-            algo.fit()
+            metrics = algo.fit()
             print(f"\rE: {epoch:>{len(str(num_epochs))}} R: {np.mean(report['R'][-smoothing_window_size:]):.4f}", end="")
             if epoch % smoothing_window_size == 0:
                 print()

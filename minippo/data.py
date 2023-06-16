@@ -1,7 +1,5 @@
 import dataclasses
-from pathlib import Path
-from typing import List, Optional, TypeVar, Generic, Union
-import pickle
+from typing import List, Optional, TypeVar, Generic
 
 import torch
 from torch import Tensor
@@ -78,18 +76,25 @@ class LearningBatch:
     observation_next: Tensor
 
 
+@dataclasses.dataclass
+class AdvantageEstimationResult:
+    returns: Tensor
+    advantages: Tensor
+
+
 def discount_rewards(
     rewards: Tensor,
     termination_flags: Tensor,
     gamma: float,
-) -> Tensor:
+) -> AdvantageEstimationResult:
     returns = torch.zeros_like(rewards)
     cumulative_sum = torch.zeros(1)
     for i in range(len(rewards) - 1, -1, -1):
         cumulative_sum *= (1 - termination_flags[i]) * gamma
         cumulative_sum += rewards[i]
         returns[i] = cumulative_sum
-    return returns
+    advantages = normalize(returns, dim=0)
+    return AdvantageEstimationResult(returns, advantages)
 
 
 def generalized_advantage_estimation(
@@ -99,10 +104,12 @@ def generalized_advantage_estimation(
     termination_flags: Tensor,
     lmbda: float,
     gamma: float,
-) -> Tensor:
+) -> AdvantageEstimationResult:
     delta = rewards + gamma * values_next * (1 - termination_flags) - values
-    advantages = discount_rewards(delta, termination_flags, gamma=gamma * lmbda)
-    return advantages
+    adv_estimation_result = discount_rewards(delta, termination_flags, gamma=gamma * lmbda)
+    adv_estimation_result.advantages = adv_estimation_result.returns
+    adv_estimation_result.returns = adv_estimation_result.advantages + values
+    return adv_estimation_result
 
 
 def normalize(x: Tensor, dim: int = 0) -> Tensor:

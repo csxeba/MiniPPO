@@ -33,7 +33,7 @@ def main():
         actor_building_fn=get_actor_fn(env),
         actor_optimizer_building_fn=get_actor_optimizer_fn,
     )
-    ppo.executions.train_sync(algo, env_fn, num_workers=4, num_epochs=100)
+    ppo.executions.train_sync(algo, env_fn, num_workers=4, num_epochs=1000, smoothing_window_size=100)
 
 
 if __name__ == '__main__':

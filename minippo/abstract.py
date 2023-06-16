@@ -36,4 +36,4 @@ class AlgoLearnerInterface(Generic[ActType], abc.ABC):
     def incorporate_experience_buffer(self, buffer: ExperienceBuffer) -> None: pass
 
     @abc.abstractmethod
-    def fit(self) -> Dict[str, Tensor]: pass
+    def fit(self) -> Dict[str, float]: pass
