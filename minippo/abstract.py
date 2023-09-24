@@ -1,12 +1,12 @@
 import abc
-from typing import Dict, Generic, Any, Optional
+from typing import Any, Dict, Generic, Optional
 
 from torch import Tensor
-from .data import Action, ActType, LearningBatch, ExperienceBuffer
+
+from .data import Action, ActType, ExperienceBuffer, LearningBatch
 
 
 class ExperienceReplayInterface(Generic[ActType], abc.ABC):
-
     @abc.abstractmethod
     def incorporate(self, *args, **kwargs):
         pass
@@ -21,19 +21,22 @@ class ExperienceReplayInterface(Generic[ActType], abc.ABC):
 
 
 class AlgoWorkerInterface(Generic[ActType], abc.ABC):
-
     @abc.abstractmethod
     def sample_action(self, observation: Tensor) -> Action[ActType]:
         pass
 
 
 class AlgoLearnerInterface(Generic[ActType], abc.ABC):
+    @abc.abstractmethod
+    def get_worker(
+        self, params: Optional[Dict[str, Any]] = None
+    ) -> AlgoWorkerInterface[ActType]:
+        pass
 
     @abc.abstractmethod
-    def get_worker(self, params: Optional[Dict[str, Any]] = None) -> AlgoWorkerInterface[ActType]: pass
+    def incorporate_experience_buffer(self, buffer: ExperienceBuffer) -> None:
+        pass
 
     @abc.abstractmethod
-    def incorporate_experience_buffer(self, buffer: ExperienceBuffer) -> None: pass
-
-    @abc.abstractmethod
-    def fit(self) -> Dict[str, float]: pass
+    def fit(self) -> Dict[str, float]:
+        pass

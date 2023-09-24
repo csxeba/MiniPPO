@@ -1,17 +1,13 @@
-from typing import TypeVar, Generic, List, Callable
+from typing import Callable, Generic, List, TypeVar
 
-from torch import nn
-from torch import Tensor
-from torch.distributions import MultivariateNormal
-from torch.distributions import Categorical
-
+from torch import Tensor, nn
+from torch.distributions import Categorical, MultivariateNormal
 
 DistrType = TypeVar("DistrType", MultivariateNormal, Categorical)
 DistrFactory = Callable[[Tensor], DistrType]
 
 
 class Actor(nn.Module, Generic[DistrType]):
-
     def forward(self, inputs: Tensor) -> DistrType:
         raise NotImplementedError
 
@@ -20,7 +16,6 @@ class Actor(nn.Module, Generic[DistrType]):
 
 
 class Critic(nn.Module):
-
     def forward(self, inputs: Tensor) -> Tensor:
         raise NotImplementedError
 
@@ -29,21 +24,30 @@ class Critic(nn.Module):
 
 
 class FFActor(Actor[DistrType]):
-
-    def __init__(self, in_features: int, out_features: int, hiddens: List[int], distr_factory: DistrFactory):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        hiddens: List[int],
+        distr_factory: DistrFactory,
+    ):
         super().__init__()
-        layers = [nn.Linear(in_features, hiddens[0]), nn.LeakyReLU()]
+        layers = [nn.Linear(in_features, hiddens[0]), nn.Tanh()]
         h1 = hiddens[0]
         for h0, h1 in zip(hiddens[:-1], hiddens[1:]):
-            layers.extend([
-                nn.BatchNorm1d(h0),
-                nn.Linear(h0, h1),
-                nn.LeakyReLU(),
-            ])
-        layers.extend([
-            nn.BatchNorm1d(h1),
-            nn.Linear(h1, out_features),
-        ])
+            layers.extend(
+                [
+                    nn.BatchNorm1d(h0),
+                    nn.Linear(h0, h1),
+                    nn.Tanh(),
+                ]
+            )
+        layers.extend(
+            [
+                # nn.BatchNorm1d(h1),
+                nn.Linear(h1, out_features),
+            ]
+        )
         self.layers = nn.Sequential(*layers)
         self.distr_factory = distr_factory
 
@@ -54,7 +58,6 @@ class FFActor(Actor[DistrType]):
 
 
 class FFCritic(Critic):
-
     def __init__(self, in_features: int, hiddens: List[int]):
         super().__init__()
         layers = [nn.Linear(in_features, hiddens[0]), nn.Tanh()]
@@ -67,5 +70,3 @@ class FFCritic(Critic):
     def forward(self, inputs: Tensor) -> Tensor:
         critic_values = self.layers(inputs)
         return critic_values
-
-

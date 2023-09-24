@@ -1,10 +1,11 @@
 import dataclasses
-from typing import List, Optional, TypeVar, Generic
+from pathlib import Path
+from typing import Any, Dict, Generic, List, Optional, TypeVar, Union
 
+import numpy as np
 import torch
 from torch import Tensor
 from torch.distributions import Distribution
-
 
 ActType = TypeVar("ActType")
 
@@ -32,6 +33,61 @@ class ExperienceItem(Generic[ActType]):
     terminated: bool
     truncated: bool
     observation_next: Optional[Tensor] = None
+    worker_id: Optional[int] = None
+    episode_id: Optional[int] = None
+
+    def __post_init__(self):
+        assert self.terminated and (self.observation_next is None)
+
+    def serialize(self, path: Union[str, Path]) -> None:
+        data = dataclasses.asdict(self)
+        torch.save(data, path)
+
+    @classmethod
+    def deserialize(cls, path: Union[str, Path]) -> "ExperienceItem":
+        data = torch.load(path)
+        return cls(**data)
+
+
+@dataclasses.dataclass
+class ZippedExperienceItems(Generic[ActType]):
+    steps: Tensor  # int: [N]
+    observations: Tensor  # float: [N, ...]
+    actions: List[Action[ActType]]
+    rewards: Tensor  # float: [N]
+    termination_flags: Tensor  # bool: [N]
+    truncation_flags: Tensor  # bool: [N]
+    observations_next: Optional[Tensor] = None  # bool: [N]
+    worker_id: Optional[Tensor] = None  # bool: [N]
+    episode_id: Optional[Tensor] = None  # bool: [N]
+
+    @classmethod
+    def from_experience_items(
+        cls, experience_items: List[ExperienceItem]
+    ) -> "ZippedExperienceItems":
+        observations_next = torch.stack(
+            [exp.observation_next for exp in experience_items]
+        )
+        return cls(
+            steps=torch.tensor([exp.step for exp in experience_items]),
+            observations=torch.stack([exp.observation for exp in experience_items]),
+            actions=[exp.action for exp in experience_items],
+            rewards=torch.tensor([exp.reward for exp in experience_items]),
+            termination_flags=torch.tensor(
+                [exp.terminated for exp in experience_items]
+            ),
+            truncation_flags=torch.tensor([exp.truncated for exp in experience_items]),
+            observations_next=observations_next,
+        )
+
+    def serialize(self, path: Union[str, Path]) -> None:
+        data = dataclasses.asdict(self)
+        torch.save(data, path)
+
+    @classmethod
+    def deserialize(cls, path: Union[str, Path]) -> "ZippedExperienceItems":
+        data = torch.load(path)
+        return cls(**data)
 
 
 @dataclasses.dataclass
@@ -106,10 +162,12 @@ def generalized_advantage_estimation(
     gamma: float,
 ) -> AdvantageEstimationResult:
     delta = rewards + gamma * values_next * (1 - termination_flags) - values
-    adv_estimation_result = discount_rewards(delta, termination_flags, gamma=gamma * lmbda)
-    adv_estimation_result.advantages = adv_estimation_result.returns
-    adv_estimation_result.returns = adv_estimation_result.advantages + values
-    return adv_estimation_result
+    advantages = discount_rewards(delta, termination_flags, gamma=gamma * lmbda).returns
+    returns = advantages + values
+    return AdvantageEstimationResult(
+        returns=returns,
+        advantages=advantages,
+    )
 
 
 def normalize(x: Tensor, dim: int = 0) -> Tensor:

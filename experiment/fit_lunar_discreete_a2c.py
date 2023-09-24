@@ -49,17 +49,13 @@ def critic_optimizer_fn(critic: ppo.network.FFCritic) -> torch.optim.Optimizer:
 
 def main():
     env = env_fn()
-    algo = ppo.algorithm.PPO(
+    algo = ppo.algorithm.A2C(
         actor_building_fn=get_actor_fn(env),
         actor_optimizer_building_fn=actor_optimizer_fn,
         critic_building_fn=get_critic_fn(env),
         critic_optimizer_building_fn=critic_optimizer_fn,
         ppo_config=ppo.algorithm.Config.from_env(
             env,
-            critic_num_updates=80,
-            actor_num_updates=80,
-            critic_batch_size=32,
-            actor_batch_size=32,
             gae_lambda=0.97,
         ),
     )

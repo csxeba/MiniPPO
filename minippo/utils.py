@@ -12,14 +12,18 @@ def average_dict_of_floats(metrics_dicts: List[Dict[str, float]]) -> Dict[str, f
 
 
 class MetricAggregator:
-
     def __init__(self):
         self.aggregation: Dict[str, List[float]] = defaultdict(list)
 
     def _log_single_metric(self, name: str, value: float):
         self.aggregation[name].append(value)
 
-    def log_metrics(self, metrics: Union[Dict[str, float], List[Dict[str, float]], Dict[str, List[float]]]):
+    def log_metrics(
+        self,
+        metrics: Union[
+            Dict[str, float], List[Dict[str, float]], Dict[str, List[float]]
+        ],
+    ):
         if isinstance(metrics, list):
             for element in metrics:
                 assert isinstance(element, dict)
@@ -50,10 +54,11 @@ class MetricAggregator:
 
     def generate_report(self, epoch: int, num_epochs: int, smoothing_window_size: int):
         report = self.get_metrics(smoothing_window_size=smoothing_window_size)
-        R = report.pop("R")
-        if epoch != num_epochs and (epoch % (smoothing_window_size * 10) == 0 or epoch == 1):
+        if epoch != num_epochs and (
+            epoch % (smoothing_window_size * 10) == 0 or epoch == 1
+        ):
             print(self._get_header(report))
-        report_str = [f"{epoch: ^7}", f"{R: >8.4f}"]
+        report_str = [f"{epoch: ^7}"]
         report_str += [f"{v: >8.4f}" for k, v in report.items()]
         print("\r|", " | ".join(report_str), "|", end="")
         if epoch % smoothing_window_size == 0:
