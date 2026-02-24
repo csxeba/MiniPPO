@@ -1,8 +1,7 @@
 import dataclasses
 from pathlib import Path
-from typing import Any, Dict, Generic, List, Optional, TypeVar, Union
+from typing import Generic, List, Optional, TypeVar, Union
 
-import numpy as np
 import torch
 from torch import Tensor
 from torch.distributions import Distribution
@@ -36,9 +35,6 @@ class ExperienceItem(Generic[ActType]):
     worker_id: Optional[int] = None
     episode_id: Optional[int] = None
 
-    def __post_init__(self):
-        assert self.terminated and (self.observation_next is None)
-
     def serialize(self, path: Union[str, Path]) -> None:
         data = dataclasses.asdict(self)
         torch.save(data, path)
@@ -63,7 +59,7 @@ class ZippedExperienceItems(Generic[ActType]):
 
     @classmethod
     def from_experience_items(
-        cls, experience_items: List[ExperienceItem]
+            cls, experience_items: List[ExperienceItem]
     ) -> "ZippedExperienceItems":
         observations_next = torch.stack(
             [exp.observation_next for exp in experience_items]
@@ -98,7 +94,7 @@ class ExperienceBuffer(Generic[ActType]):
     termination_flags: List[bool] = dataclasses.field(default_factory=list)
     truncation_flags: List[bool] = dataclasses.field(default_factory=list)
     observations_next: List[Tensor] = dataclasses.field(default_factory=list)
-    finalized: bool = False
+    finalized: bool = dataclasses.field(default=False)
 
     def save(self, exp: ExperienceItem[ActType]):
         if exp.observation_next is None:
@@ -115,12 +111,8 @@ class ExperienceBuffer(Generic[ActType]):
             self.finalized = True
 
     def reset(self):
-        self.observations = []
-        self.actions = []
-        self.rewards = []
-        self.termination_flags = []
-        self.truncation_flags = []
-        self.finalized = False
+        for field in dataclasses.fields(self):
+            setattr(self, field.name, field.default)
 
 
 @dataclasses.dataclass
@@ -171,4 +163,4 @@ def generalized_advantage_estimation(
 
 
 def normalize(x: Tensor, dim: int = 0) -> Tensor:
-    return (x - x.mean(dim=dim)) / torch.std(x, dim=dim)
+    return (x - x.mean(dim=dim)) / (torch.std(x, dim=dim, unbiased=False) + 1e-8)

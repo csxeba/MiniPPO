@@ -1,28 +1,33 @@
-from typing import Tuple
-
+import gymnasium as gym
 import torch
 from torch import Tensor
 
-
-def discount(rewards: Tensor, termination_flags: Tensor, gamma):
-    returns = torch.zeros_like(rewards)
-    cumulative_sum = torch.zeros(1)
-    for i in range(len(rewards) - 1, -1, -1):
-        cumulative_sum *= (1 - termination_flags[i]) * gamma
-        cumulative_sum += rewards[i]
-        returns[i] = cumulative_sum
-    return returns
+from minippo import abstract, data, workers
 
 
-def gae_mine(
-    rewards: Tensor,
-    values: Tensor,
-    values_next: Tensor,
-    termination_flags: Tensor,
-    lmbda: float,
-    gamma: float,
-) -> Tuple[Tensor, Tensor]:
-    delta = rewards + gamma * values_next * (1 - termination_flags) - values
-    advantages = discount_rewards(delta, termination_flags, gamma=gamma * lmbda).returns
-    returns = delta + values
-    return returns, advantages
+class WorkerMock(abstract.AlgoWorkerInterface):
+
+    def __init__(self, act_space: gym.spaces.Space):
+        super().__init__()
+        self.act_space = act_space
+
+    def sample_action(self, observation: Tensor) -> data.Action[data.ActType]:
+        action = self.act_space.sample()
+        action = torch.tensor(action)
+        return data.Action(action.unsqueeze(0), log_prob=None)
+
+
+def main():
+    env = gym.make('CartPole-v1')
+    worker_future = workers.dispatch(
+        worker_fn=lambda: WorkerMock(env.action_space),
+        env_fn=lambda: gym.make('CartPole-v1'),
+        worker_id=0,
+        save_root=None,
+    )
+    for retval in worker_future:
+        print(retval)
+
+
+if __name__ == '__main__':
+    main()

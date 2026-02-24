@@ -102,8 +102,9 @@ class PolicyGradientExperienceReplay(abstract.ExperienceReplayInterface[int]):
 
     def get_learning_batch(self, batch_size: int) -> PPOBatch:
         if batch_size == -1:
-            batch_size = len(self.inputs)
-        arg = torch.randint(0, len(self.inputs), size=[batch_size])
+            arg = torch.arange(len(self.inputs))
+        else:
+            arg = torch.randint(0, len(self.inputs), size=[batch_size])
         return PPOBatch(
             inputs=self.inputs[arg],
             actions=self.actions[arg],
@@ -165,6 +166,7 @@ class PolicyGradient(abstract.AlgoLearnerInterface[int]):
     def loss_actor(self, batch: PPOBatch) -> Dict[str, Tensor]:
         distr = self.actor(batch.inputs)
         log_probs = distr.log_prob(batch.actions)
+        assert log_probs.shape == batch.advantages.shape, f"{log_probs.shape=} != {batch.advantages.shape=}"
         loss = -torch.mean(log_probs * batch.advantages)
         return {
             "actor_loss": loss,
@@ -184,11 +186,11 @@ class PolicyGradient(abstract.AlgoLearnerInterface[int]):
             rewards, term_flags, self.cfg.discount_factor_gamma
         )
         self.experience_replay.incorporate(
-            xs[:-1],
-            actions,
-            log_probs,
-            adv_estimation.returns,
-            adv_estimation.advantages,
+            inputs=xs[:-1],
+            actions=actions,
+            log_probs=log_probs,
+            returns=adv_estimation.returns,
+            advantages=adv_estimation.advantages,
         )
 
     def fit(self) -> Dict[str, float]:

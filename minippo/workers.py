@@ -1,7 +1,6 @@
 from pathlib import Path
 from typing import Callable, Iterable, NamedTuple, Optional
 
-import ray
 import torch
 from gymnasium import Env
 
@@ -37,25 +36,22 @@ class WorkerReport(NamedTuple):
         )
 
 
-@ray.remote
 def dispatch(
-        worker_fn: Callable[[], abstract.AlgoWorkerInterface],
-        env_fn: Callable[[], Env],
-        worker_id: int,
-        save_root: Optional[Path],
+    worker_fn: Callable[[], abstract.AlgoWorkerInterface],
+    env_fn: Callable[[], Env],
+    worker_id: int,
+    save_root: Optional[Path],
 ) -> Iterable[ExperienceItem]:
     worker = worker_fn()
     env = env_fn()
     rollout = roll.Roll(worker, env)
     job = rollout.synchronized_job()
     experience: ExperienceItem
-    episode_counter = 1
     for step, experience in enumerate(job, start=1):
-        experience.episode_id = episode_counter
         experience.worker_id = worker_id
         if save_root is not None:
             experience.serialize(
-                save_root / f"w{worker_id}_e{episode_counter}_s{step}.exp"
+                save_root / f"w{worker_id}_e{experience.episode_id}_s{step}.exp"
             )
         else:
             yield experience

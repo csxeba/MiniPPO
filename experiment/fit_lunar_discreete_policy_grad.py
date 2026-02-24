@@ -26,7 +26,7 @@ def get_actor_fn(env: gym.Env[float, int]):
 
 
 def get_actor_optimizer_fn(actor: ppo.network.FFActor[int]) -> torch.optim.Optimizer:
-    return torch.optim.Adam(actor.parameters(), lr=1e-3)
+    return torch.optim.Adam(actor.parameters(), lr=1e-4)
 
 
 def main():
@@ -36,8 +36,8 @@ def main():
         actor_building_fn=get_actor_fn(env),
         actor_optimizer_building_fn=get_actor_optimizer_fn,
     )
-    ppo.executions.train_async(
-        algo, env_fn, num_workers=4, num_epochs=1000, smoothing_window_size=100
+    ppo.executions.train_sync(
+        algo, env_fn, num_workers=1, num_epochs=1000, smoothing_window_size=100
     )
 
 

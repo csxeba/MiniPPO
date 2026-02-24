@@ -27,7 +27,7 @@ class Roll:
                     observation = torch.tensor(observation, dtype=torch.float32)
                 action = self.worker.sample_action(observation[None, ...])
                 observation_next, reward, termination, truncation, info = self.env.step(
-                    action.action[0].item()
+                    action.action[0].numpy()
                 )
                 observation_next = torch.tensor(observation_next, dtype=torch.float32)
                 experience_item = ExperienceItem(
@@ -41,6 +41,7 @@ class Roll:
                     episode_id=episode_counter,
                 )
                 yield experience_item
+
                 if termination or truncation:
                     break
                 observation = observation_next
