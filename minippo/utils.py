@@ -1,6 +1,6 @@
 import statistics as stat
 from collections import defaultdict
-from typing import Dict, List, Union
+from typing import Dict, List, Union, Iterable
 
 
 def average_dict_of_floats(metrics_dicts: List[Dict[str, float]]) -> Dict[str, float]:
@@ -21,7 +21,7 @@ class MetricAggregator:
     def log_metrics(
         self,
         metrics: Union[
-            Dict[str, float], List[Dict[str, float]], Dict[str, List[float]]
+            Dict[str, float], List[Dict[str, float]], Dict[str, Iterable[float]]
         ],
     ):
         if isinstance(metrics, list):
@@ -33,7 +33,7 @@ class MetricAggregator:
             for name, value in metrics.items():
                 if isinstance(value, float):
                     self._log_single_metric(name, value)
-                elif isinstance(value, list):
+                elif hasattr(value, "__iter__"):
                     for element in value:
                         self._log_single_metric(name, element)
                 else:

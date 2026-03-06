@@ -1,6 +1,5 @@
 import dataclasses
-from pathlib import Path
-from typing import Generic, List, Optional, TypeVar, Union
+from typing import Generic, TypeVar
 
 import torch
 from torch import Tensor
@@ -12,103 +11,41 @@ ActType = TypeVar("ActType")
 @dataclasses.dataclass
 class Action(Generic[ActType]):
     action: Tensor
-    log_prob: Optional[Tensor]
+    log_prob: Tensor | None
 
     @classmethod
     def from_distribution(cls, distribution: Distribution):
         action = distribution.sample()
         return cls(action=action, log_prob=distribution.log_prob(action))
 
-    def adapt_action(self) -> List[ActType]:
+    def adapt_action(self) -> list[ActType]:
         return []
 
 
 @dataclasses.dataclass
-class ExperienceItem(Generic[ActType]):
-    step: int
-    observation: Tensor
-    action: Action[ActType]
-    reward: float
-    terminated: bool
-    truncated: bool
-    observation_next: Optional[Tensor] = None
-    worker_id: Optional[int] = None
-    episode_id: Optional[int] = None
-
-    def serialize(self, path: Union[str, Path]) -> None:
-        data = dataclasses.asdict(self)
-        torch.save(data, path)
-
-    @classmethod
-    def deserialize(cls, path: Union[str, Path]) -> "ExperienceItem":
-        data = torch.load(path)
-        return cls(**data)
-
-
-@dataclasses.dataclass
-class ZippedExperienceItems(Generic[ActType]):
-    steps: Tensor  # int: [N]
-    observations: Tensor  # float: [N, ...]
-    actions: List[Action[ActType]]
-    rewards: Tensor  # float: [N]
-    termination_flags: Tensor  # bool: [N]
-    truncation_flags: Tensor  # bool: [N]
-    observations_next: Optional[Tensor] = None  # bool: [N]
-    worker_id: Optional[Tensor] = None  # bool: [N]
-    episode_id: Optional[Tensor] = None  # bool: [N]
-
-    @classmethod
-    def from_experience_items(
-            cls, experience_items: List[ExperienceItem]
-    ) -> "ZippedExperienceItems":
-        observations_next = torch.stack(
-            [exp.observation_next for exp in experience_items]
-        )
-        return cls(
-            steps=torch.tensor([exp.step for exp in experience_items]),
-            observations=torch.stack([exp.observation for exp in experience_items]),
-            actions=[exp.action for exp in experience_items],
-            rewards=torch.tensor([exp.reward for exp in experience_items]),
-            termination_flags=torch.tensor(
-                [exp.terminated for exp in experience_items]
-            ),
-            truncation_flags=torch.tensor([exp.truncated for exp in experience_items]),
-            observations_next=observations_next,
-        )
-
-    def serialize(self, path: Union[str, Path]) -> None:
-        data = dataclasses.asdict(self)
-        torch.save(data, path)
-
-    @classmethod
-    def deserialize(cls, path: Union[str, Path]) -> "ZippedExperienceItems":
-        data = torch.load(path)
-        return cls(**data)
-
-
-@dataclasses.dataclass
 class ExperienceBuffer(Generic[ActType]):
-    observations: List[Tensor] = dataclasses.field(default_factory=list)
-    actions: List[Action[ActType]] = dataclasses.field(default_factory=list)
-    rewards: List[float] = dataclasses.field(default_factory=list)
-    termination_flags: List[bool] = dataclasses.field(default_factory=list)
-    truncation_flags: List[bool] = dataclasses.field(default_factory=list)
-    observations_next: List[Tensor] = dataclasses.field(default_factory=list)
-    finalized: bool = dataclasses.field(default=False)
+    observations: list[Tensor] = dataclasses.field(default_factory=list)
+    actions: list[Tensor] = dataclasses.field(default_factory=list)
+    rewards: list[Tensor] = dataclasses.field(default_factory=list)
+    termination_flags: list[Tensor] = dataclasses.field(default_factory=list)
+    truncation_flags: list[Tensor] = dataclasses.field(default_factory=list)
+    observations_next: list[Tensor] = dataclasses.field(default_factory=list)
 
-    def save(self, exp: ExperienceItem[ActType]):
-        if exp.observation_next is None:
-            raise RuntimeError("Unfinalized experience item received for saving.")
-        if self.finalized:
-            raise RuntimeError("Cannot save into a finalized ExperienceBuffer.")
-        self.observations.append(exp.observation)
-        self.observations_next.append(exp.observation_next)
-        self.actions.append(exp.action)
-        self.rewards.append(exp.reward)
-        self.termination_flags.append(exp.terminated)
-        self.truncation_flags.append(exp.truncated)
-        if exp.terminated or exp.truncated:
-            self.finalized = True
+    def save(
+        self,
+        observation: Tensor,
+        action: Tensor,
+        reward: Tensor,
+        terminated: Tensor,
+        truncated: Tensor,
+        observation_next: Tensor,
+    ):
+        self.observations.append(observation)
+        self.observations_next.append(observation_next)
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.termination_flags.append(terminated)
+        self.truncation_flags.append(truncated)
 
     def reset(self):
         for field in dataclasses.fields(self):
@@ -119,7 +56,7 @@ class ExperienceBuffer(Generic[ActType]):
 class LearningBatch:
     observation: Tensor
     action: Tensor
-    action_log_prob: Optional[Tensor]
+    action_log_prob: Tensor | None
     reward: Tensor
     observation_next: Tensor
 

@@ -15,7 +15,7 @@ def env_fn():
 
 def get_actor_fn(env: gym.Env[float, int]):
     def f():
-        return ppo.network.FFActor(
+        return ppo.algorithm.FFActor(
             in_features=env.observation_space.shape[0],
             out_features=env.action_space.n,
             hiddens=(64, 64),
@@ -25,7 +25,7 @@ def get_actor_fn(env: gym.Env[float, int]):
     return f
 
 
-def get_actor_optimizer_fn(actor: ppo.network.FFActor[int]) -> torch.optim.Optimizer:
+def get_actor_optimizer_fn(actor: ppo.algorithm.FFActor[int]) -> torch.optim.Optimizer:
     return torch.optim.Adam(actor.parameters(), lr=1e-4)
 
 
@@ -36,8 +36,12 @@ def main():
         actor_building_fn=get_actor_fn(env),
         actor_optimizer_building_fn=get_actor_optimizer_fn,
     )
-    ppo.executions.train_sync(
-        algo, env_fn, num_workers=1, num_epochs=1000, smoothing_window_size=100
+    ppo.execution.train_vectorenv(
+        algo,
+        env_fn=env_fn,
+        num_workers=4,
+        num_epochs=100,
+        steps_per_update=2,
     )
 
 

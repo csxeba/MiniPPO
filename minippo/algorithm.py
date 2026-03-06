@@ -1,16 +1,17 @@
 import copy
 import dataclasses
-from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple, Generic, List, TypeVar
 
 import gymnasium as gym
 import numpy as np
 import torch
 from torch import Tensor, nn
-from torch.distributions import Distribution
+from torch.distributions import Distribution, Categorical, MultivariateNormal
 
-from . import abstract, data, network, utils
-from .abstract import AlgoWorkerInterface
-from .data import ActType, ExperienceBuffer, ExperienceItem
+from minippo import abstract, data, utils
+
+DistrType = TypeVar("DistrType", MultivariateNormal, Categorical)
+DistrFactory = Callable[[Tensor], DistrType]
 
 
 @dataclasses.dataclass
@@ -123,6 +124,71 @@ class PolicyGradientExperienceReplay(abstract.ExperienceReplayInterface[int]):
         self.advantages: Tensor = torch.zeros(0, dtype=torch.float)
 
 
+class Actor(nn.Module, Generic[DistrType]):
+    def forward(self, inputs: Tensor) -> DistrType:
+        raise NotImplementedError
+
+    def __call__(self, inputs: Tensor) -> DistrType:
+        return self.forward(inputs)
+
+
+class Critic(nn.Module):
+    def forward(self, inputs: Tensor) -> Tensor:
+        raise NotImplementedError
+
+    def __call__(self, inputs: Tensor) -> Tensor:
+        return self.forward(inputs)
+
+
+class FFActor(Actor[DistrType]):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        hiddens: List[int],
+        distr_factory: DistrFactory,
+    ):
+        super().__init__()
+        layers = [nn.Linear(in_features, hiddens[0]), nn.Tanh()]
+        h1 = hiddens[0]
+        for h0, h1 in zip(hiddens[:-1], hiddens[1:]):
+            layers.extend(
+                [
+                    nn.BatchNorm1d(h0),
+                    nn.Linear(h0, h1),
+                    nn.Tanh(),
+                ]
+            )
+        layers.extend(
+            [
+                # nn.BatchNorm1d(h1),
+                nn.Linear(h1, out_features),
+            ]
+        )
+        self.layers = nn.Sequential(*layers)
+        self.distr_factory = distr_factory
+
+    def forward(self, inputs: Tensor) -> DistrType:
+        policy_output = self.layers(inputs)
+        distr = self.distr_factory(policy_output)
+        return distr
+
+
+class FFCritic(Critic):
+    def __init__(self, in_features: int, hiddens: List[int]):
+        super().__init__()
+        layers = [nn.Linear(in_features, hiddens[0]), nn.Tanh()]
+        h1 = hiddens[0]
+        for h0, h1 in zip(hiddens[:-1], hiddens[1:]):
+            layers.extend([nn.BatchNorm1d(h0), nn.Linear(h0, h1), nn.Tanh()])
+        layers.extend([nn.Linear(h1, 1)])
+        self.layers = nn.Sequential(*layers)
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        critic_values = self.layers(inputs)
+        return critic_values
+
+
 class StochasticPolicyWorker(abstract.AlgoWorkerInterface[int]):
     def __init__(self, actor_network: nn.Module) -> None:
         self.actor = actor_network
@@ -139,9 +205,9 @@ class PolicyGradient(abstract.AlgoLearnerInterface[int]):
     def __init__(
         self,
         ppo_config: Config,
-        actor_building_fn: Callable[[], network.Actor[int]],
+        actor_building_fn: Callable[[], Actor[int]],
         actor_optimizer_building_fn: Callable[
-            [network.Actor[int]], torch.optim.Optimizer
+            [Actor[int]], torch.optim.Optimizer
         ],
     ):
         self.cfg = ppo_config
@@ -208,10 +274,10 @@ class PolicyGradient(abstract.AlgoLearnerInterface[int]):
 class A2C(abstract.AlgoLearnerInterface):
     def __init__(
         self,
-        actor_building_fn: Callable[[], network.Actor],
-        critic_building_fn: Callable[[], network.Critic],
-        actor_optimizer_building_fn: Callable[[network.Actor], torch.optim.Optimizer],
-        critic_optimizer_building_fn: Callable[[network.Critic], torch.optim.Optimizer],
+        actor_building_fn: Callable[[], Actor],
+        critic_building_fn: Callable[[], Critic],
+        actor_optimizer_building_fn: Callable[[Actor], torch.optim.Optimizer],
+        critic_optimizer_building_fn: Callable[[Critic], torch.optim.Optimizer],
         ppo_config: Config,
     ):
         self.actor = actor_building_fn()
@@ -234,12 +300,12 @@ class A2C(abstract.AlgoLearnerInterface):
 
     def get_worker(
         self, params: Optional[Dict[str, Any]] = None
-    ) -> AlgoWorkerInterface[ActType]:
+    ) -> abstract.AlgoWorkerInterface[abstract.ActType]:
         worker_network = self.actor_building_fn()
         worker_network.load_state_dict(copy.deepcopy(self.actor.state_dict()))
         return StochasticPolicyWorker(worker_network)
 
-    def incorporate_experience_buffer(self, buffer: ExperienceBuffer) -> None:
+    def incorporate_experience_buffer(self, buffer: data.ExperienceBuffer) -> None:
         xs = torch.stack(buffer.observations + [buffer.observations_next[-1]], dim=0)
         rewards = torch.tensor(buffer.rewards)
         term_flags = torch.tensor(buffer.termination_flags, dtype=torch.float)
@@ -273,11 +339,6 @@ class A2C(abstract.AlgoLearnerInterface):
             advantage_estimate.returns,
             advantage_estimate.advantages,
         )
-
-    def incorporate_experience_items(self, experience_item: ExperienceItem):
-        self.critic.eval()
-        with torch.inference_mode():
-            value = self.critic(experience_item.observation[None, :])[0]
 
     def loss_critic(self, batch: PPOBatch) -> Dict[str, Any]:
         values = self.critic(batch.inputs)
