@@ -5,7 +5,7 @@ import minippo as ppo
 
 
 def env_fn():
-    raw_env = gym.make("CartPole-v1")
+    raw_env = gym.make("LunarLanding-v1")
     obs_wrapped_env = gym.wrappers.NormalizeObservation(
         gym.wrappers.FlattenObservation(raw_env)
     )

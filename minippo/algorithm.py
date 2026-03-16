@@ -1,12 +1,12 @@
 import copy
 import dataclasses
-from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple, Generic, List, TypeVar
+from typing import Any, Callable, Generic, NamedTuple, TypeVar
 
 import gymnasium as gym
 import numpy as np
 import torch
 from torch import Tensor, nn
-from torch.distributions import Distribution, Categorical, MultivariateNormal
+from torch.distributions import Categorical, Distribution, MultivariateNormal
 
 from minippo import abstract, data, utils
 
@@ -16,9 +16,10 @@ DistrFactory = Callable[[Tensor], DistrType]
 
 @dataclasses.dataclass
 class Config:
-    observation_space_shape: Tuple[int, ...]
+    n_parallel: int
+    observation_space_shape: tuple[int, ...]
     observation_space_dtype: torch.dtype
-    action_space_shape: Tuple[int, ...]
+    action_space_shape: tuple[int, ...]
     action_space_dtype: torch.dtype
     discount_factor_gamma: float = 0.99
     gae_lambda: float = 0.97
@@ -38,14 +39,14 @@ class Config:
             observation_space_dtype=env.observation_space.dtype,
             action_space_shape=env.action_space.shape,
             action_space_dtype=env.action_space.dtype,
-            **kwargs
+            **kwargs,
         )
 
-    def serialize(self) -> Dict[str, Any]:
+    def serialize(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
 
     @classmethod
-    def deserialize(cls, mapping: Dict[str, Any]) -> "Config":
+    def deserialize(cls, mapping: dict[str, Any]) -> "Config":
         return cls(**mapping)
 
 
@@ -61,7 +62,7 @@ class PolicyGradientExperienceReplay(abstract.ExperienceReplayInterface[int]):
     def __init__(
         self,
         max_len: int,
-        observation_shape: Tuple[int],
+        observation_shape: tuple[int, ...],
         action_dtype: data.ActType,
         gae_lmbda: float,
         gae_gamma: float,
@@ -145,23 +146,21 @@ class FFActor(Actor[DistrType]):
         self,
         in_features: int,
         out_features: int,
-        hiddens: List[int],
+        hiddens: tuple[int, ...],
         distr_factory: DistrFactory,
     ):
         super().__init__()
-        layers = [nn.Linear(in_features, hiddens[0]), nn.Tanh()]
+        layers = [nn.Linear(in_features, hiddens[0]), nn.ReLU()]
         h1 = hiddens[0]
         for h0, h1 in zip(hiddens[:-1], hiddens[1:]):
             layers.extend(
                 [
-                    nn.BatchNorm1d(h0),
                     nn.Linear(h0, h1),
-                    nn.Tanh(),
+                    nn.ReLU(),
                 ]
             )
         layers.extend(
             [
-                # nn.BatchNorm1d(h1),
                 nn.Linear(h1, out_features),
             ]
         )
@@ -175,12 +174,12 @@ class FFActor(Actor[DistrType]):
 
 
 class FFCritic(Critic):
-    def __init__(self, in_features: int, hiddens: List[int]):
+    def __init__(self, in_features: int, hiddens: tuple[int, ...]):
         super().__init__()
-        layers = [nn.Linear(in_features, hiddens[0]), nn.Tanh()]
+        layers = [nn.Linear(in_features, hiddens[0]), nn.ReLU()]
         h1 = hiddens[0]
         for h0, h1 in zip(hiddens[:-1], hiddens[1:]):
-            layers.extend([nn.BatchNorm1d(h0), nn.Linear(h0, h1), nn.Tanh()])
+            layers.extend([nn.Linear(h0, h1), nn.ReLU()])
         layers.extend([nn.Linear(h1, 1)])
         self.layers = nn.Sequential(*layers)
 
@@ -201,76 +200,6 @@ class StochasticPolicyWorker(abstract.AlgoWorkerInterface[int]):
         return data.Action.from_distribution(distribution)
 
 
-class PolicyGradient(abstract.AlgoLearnerInterface[int]):
-    def __init__(
-        self,
-        ppo_config: Config,
-        actor_building_fn: Callable[[], Actor[int]],
-        actor_optimizer_building_fn: Callable[
-            [Actor[int]], torch.optim.Optimizer
-        ],
-    ):
-        self.cfg = ppo_config
-        self.actor = actor_building_fn()
-        self.actor_optimizer = actor_optimizer_building_fn(self.actor)
-        self.actor_building_fn = actor_building_fn
-        self.experience_replay = PolicyGradientExperienceReplay(
-            ppo_config.experience_max_size,
-            ppo_config.observation_space_shape,
-            ppo_config.action_space_dtype,
-            ppo_config.gae_lambda,
-            ppo_config.gae_lambda,
-        )
-
-    def get_worker(
-        self, params: Optional[Dict[str, Any]] = None
-    ) -> abstract.AlgoWorkerInterface[data.ActType]:
-        worker_network = self.actor_building_fn()
-        worker_network.load_state_dict(copy.deepcopy(self.actor.state_dict()))
-        return StochasticPolicyWorker(worker_network)
-
-    def loss_actor(self, batch: PPOBatch) -> Dict[str, Tensor]:
-        distr = self.actor(batch.inputs)
-        log_probs = distr.log_prob(batch.actions)
-        assert log_probs.shape == batch.advantages.shape, f"{log_probs.shape=} != {batch.advantages.shape=}"
-        loss = -torch.mean(log_probs * batch.advantages)
-        return {
-            "actor_loss": loss,
-            "entropy": distr.entropy().mean(),
-            "kld": (batch.old_log_probs - log_probs).mean(),
-        }
-
-    def incorporate_experience_buffer(self, buffer: data.ExperienceBuffer) -> None:
-        xs = torch.stack(buffer.observations + [buffer.observations_next[-1]], dim=0)
-        rewards = torch.tensor(buffer.rewards)
-        term_flags = torch.tensor(buffer.termination_flags, dtype=torch.float)
-        actions = torch.tensor([act.action for act in buffer.actions], dtype=torch.int)
-        log_probs = torch.tensor(
-            [act.log_prob for act in buffer.actions], dtype=torch.float
-        )
-        adv_estimation = data.discount_rewards(
-            rewards, term_flags, self.cfg.discount_factor_gamma
-        )
-        self.experience_replay.incorporate(
-            inputs=xs[:-1],
-            actions=actions,
-            log_probs=log_probs,
-            returns=adv_estimation.returns,
-            advantages=adv_estimation.advantages,
-        )
-
-    def fit(self) -> Dict[str, float]:
-        self.actor.train()
-        batch = self.experience_replay.get_learning_batch(batch_size=-1)
-        result = self.loss_actor(batch)
-        actor_loss = result["actor_loss"]
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
-        self.experience_replay.reset()
-        return {k: v.item() for k, v in result.items()}
-
-
 class A2C(abstract.AlgoLearnerInterface):
     def __init__(
         self,
@@ -286,11 +215,11 @@ class A2C(abstract.AlgoLearnerInterface):
         self.critic = critic_building_fn()
         self.critic_optimizer = critic_optimizer_building_fn(self.critic)
         self.experience_replay = PolicyGradientExperienceReplay(
-            ppo_config.experience_max_size,
-            ppo_config.observation_space_shape,
-            ppo_config.action_space_dtype,
-            ppo_config.gae_lambda,
-            ppo_config.gae_lambda,
+            max_len=ppo_config.experience_max_size,
+            observation_shape=ppo_config.observation_space_shape,
+            action_dtype=ppo_config.action_space_dtype,
+            gae_lmbda=ppo_config.gae_lambda,
+            gae_gamma=ppo_config.gae_lambda,
         )
         self.cfg = ppo_config
         if ppo_config.gae_lambda == 0.0:
@@ -299,31 +228,39 @@ class A2C(abstract.AlgoLearnerInterface):
             print(" [MiniPPO] - Advantage estimation is done with GAE")
 
     def get_worker(
-        self, params: Optional[Dict[str, Any]] = None
+        self, params: dict[str, Any] | None = None
     ) -> abstract.AlgoWorkerInterface[abstract.ActType]:
         worker_network = self.actor_building_fn()
         worker_network.load_state_dict(copy.deepcopy(self.actor.state_dict()))
         return StochasticPolicyWorker(worker_network)
 
     def incorporate_experience_buffer(self, buffer: data.ExperienceBuffer) -> None:
+        # Shapes: [n_steps, n_parallel, n_dim]
         xs = torch.stack(buffer.observations + [buffer.observations_next[-1]], dim=0)
-        rewards = torch.tensor(buffer.rewards)
-        term_flags = torch.tensor(buffer.termination_flags, dtype=torch.float)
-        actions = torch.tensor([act.action for act in buffer.actions], dtype=torch.int)
-        log_probs = torch.tensor(
-            [act.log_prob for act in buffer.actions], dtype=torch.float
-        )
+        rewards = torch.stack(buffer.rewards)
+        term_flags = torch.stack(buffer.termination_flags)
+        trunc_flags = torch.stack(buffer.truncation_flags)
+        actions = torch.stack(buffer.actions)
+        log_probs = torch.stack(buffer.action_logprobs)
+        n_steps, n_parallel = xs.shape[:2]
+        n_steps -= 1  # correct for final obs
+        assert (
+            n_parallel == self.cfg.n_parallel
+        ), f"{n_steps=} != {self.cfg.n_parallel=}"
+        x_dims = list(xs.shape[2:])
         self.critic.eval()
         with torch.inference_mode():
-            all_values = self.critic(xs)[..., 0]
+            all_values = self.critic(xs.reshape(-1, *x_dims))[..., 0]
+            all_values = all_values.reshape(n_steps + 1, n_parallel)
         if self.cfg.gae_lambda > 0.0:
             advantage_estimate = data.generalized_advantage_estimation(
-                rewards,
-                all_values[:-1],
-                all_values[1:],
-                term_flags,
-                self.cfg.gae_lambda,
-                self.cfg.discount_factor_gamma,
+                rewards=rewards,
+                values=all_values[:-1],
+                values_next=all_values[1:],
+                termination_flags=term_flags,
+                truncation_flags=trunc_flags,
+                lmbda=self.cfg.gae_lambda,
+                gamma=self.cfg.discount_factor_gamma,
             )
         else:
             advantage_estimate = data.discount_rewards(
@@ -333,15 +270,15 @@ class A2C(abstract.AlgoLearnerInterface):
             )
             advantage_estimate.advantages -= all_values[1:]
         self.experience_replay.incorporate(
-            xs[:-1],
-            actions,
-            log_probs,
-            advantage_estimate.returns,
-            advantage_estimate.advantages,
+            inputs=xs[:-1].reshape(-1, *x_dims),
+            actions=actions.reshape(-1),
+            log_probs=log_probs.reshape(-1),
+            returns=advantage_estimate.returns.reshape(-1),
+            advantages=advantage_estimate.advantages.reshape(-1),
         )
 
-    def loss_critic(self, batch: PPOBatch) -> Dict[str, Any]:
-        values = self.critic(batch.inputs)
+    def loss_critic(self, batch: PPOBatch) -> dict[str, Any]:
+        values = self.critic(batch.inputs)[:, 0]
         loss = (values - batch.critic_targets).square().mean()
         return {
             "critic_loss": loss,
@@ -350,10 +287,12 @@ class A2C(abstract.AlgoLearnerInterface):
             },
         }
 
-    def loss_actor(self, batch: PPOBatch) -> Dict[str, Tensor]:
+    def loss_actor(self, batch: PPOBatch) -> dict[str, Tensor]:
         distr = self.actor(batch.inputs)
         log_probs = distr.log_prob(batch.actions)
+        entropy = distr.entropy()
         loss = -torch.mean(log_probs * batch.advantages)
+        loss = loss - self.cfg.entropy_beta * entropy.mean()
         return {
             "actor_loss": loss,
             "actor_metrics": {
@@ -362,13 +301,14 @@ class A2C(abstract.AlgoLearnerInterface):
             },
         }
 
-    def fit(self) -> Dict[str, float]:
+    def fit(self) -> dict[str, float]:
         self.critic.train()
         metrics = {}
         batch = self.experience_replay.get_learning_batch(self.cfg.critic_batch_size)
         result = self.loss_critic(batch)
         self.critic_optimizer.zero_grad()
         result["critic_loss"].backward()
+        nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
         self.critic_optimizer.step()
         critic_metrics = {"critic": result["critic_loss"].detach().item()}
         critic_metrics.update(result["critic_metrics"])
@@ -377,6 +317,7 @@ class A2C(abstract.AlgoLearnerInterface):
         result = self.loss_actor(batch)
         self.actor_optimizer.zero_grad()
         result["actor_loss"].backward()
+        nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
         self.actor_optimizer.step()
         actor_metrics = {"actor": result["actor_loss"].detach().item()}
         actor_metrics.update(result["actor_metrics"])
@@ -387,7 +328,7 @@ class A2C(abstract.AlgoLearnerInterface):
 
 
 class PPO(A2C):
-    def loss_actor(self, batch: PPOBatch) -> Dict[str, Any]:
+    def loss_actor(self, batch: PPOBatch) -> dict[str, Any]:
         policy_distr = self.actor(batch.inputs)
         new_log_probs = policy_distr.log_prob(batch.actions)
         prob_ratio = torch.exp(new_log_probs - batch.old_log_probs)
@@ -409,7 +350,7 @@ class PPO(A2C):
             },
         }
 
-    def fit(self) -> Dict[str, float]:
+    def fit(self) -> dict[str, float]:
         self.critic.train()
         metrics = []
         for i in range(self.cfg.critic_num_updates):

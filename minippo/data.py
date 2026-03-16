@@ -18,14 +18,12 @@ class Action(Generic[ActType]):
         action = distribution.sample()
         return cls(action=action, log_prob=distribution.log_prob(action))
 
-    def adapt_action(self) -> list[ActType]:
-        return []
-
 
 @dataclasses.dataclass
 class ExperienceBuffer(Generic[ActType]):
     observations: list[Tensor] = dataclasses.field(default_factory=list)
     actions: list[Tensor] = dataclasses.field(default_factory=list)
+    action_logprobs: list[Tensor] = dataclasses.field(default_factory=list)
     rewards: list[Tensor] = dataclasses.field(default_factory=list)
     termination_flags: list[Tensor] = dataclasses.field(default_factory=list)
     truncation_flags: list[Tensor] = dataclasses.field(default_factory=list)
@@ -35,6 +33,7 @@ class ExperienceBuffer(Generic[ActType]):
         self,
         observation: Tensor,
         action: Tensor,
+        action_logprobs: Tensor,
         reward: Tensor,
         terminated: Tensor,
         truncated: Tensor,
@@ -43,13 +42,14 @@ class ExperienceBuffer(Generic[ActType]):
         self.observations.append(observation)
         self.observations_next.append(observation_next)
         self.actions.append(action)
+        self.action_logprobs.append(action_logprobs)
         self.rewards.append(reward)
         self.termination_flags.append(terminated)
         self.truncation_flags.append(truncated)
 
     def reset(self):
         for field in dataclasses.fields(self):
-            setattr(self, field.name, field.default)
+            setattr(self, field.name, field.default_factory())
 
 
 @dataclasses.dataclass
@@ -67,19 +67,23 @@ class AdvantageEstimationResult:
     advantages: Tensor
 
 
+def normalize(x: Tensor) -> Tensor:
+    return (x - x.mean()) / (torch.std(x, unbiased=False) + 1e-8)
+
+
 def discount_rewards(
     rewards: Tensor,
-    termination_flags: Tensor,
+    episode_ends: Tensor,
     gamma: float,
 ) -> AdvantageEstimationResult:
     returns = torch.zeros_like(rewards)
-    cumulative_sum = torch.zeros(1)
+    cumulative_sum = torch.zeros(rewards.shape[1])
     for i in range(len(rewards) - 1, -1, -1):
-        cumulative_sum *= (1 - termination_flags[i]) * gamma
-        cumulative_sum += rewards[i]
+        cumulative_sum = cumulative_sum * (1 - episode_ends[i]) * gamma + rewards[i]
         returns[i] = cumulative_sum
-    advantages = normalize(returns, dim=0)
-    return AdvantageEstimationResult(returns, advantages)
+
+    advantages = normalize(returns)
+    return AdvantageEstimationResult(returns=returns, advantages=advantages)
 
 
 def generalized_advantage_estimation(
@@ -87,17 +91,16 @@ def generalized_advantage_estimation(
     values: Tensor,
     values_next: Tensor,
     termination_flags: Tensor,
+    truncation_flags: Tensor,
     lmbda: float,
     gamma: float,
 ) -> AdvantageEstimationResult:
+    episode_ends = torch.clamp(termination_flags + truncation_flags, 0.0, 1.0)
     delta = rewards + gamma * values_next * (1 - termination_flags) - values
-    advantages = discount_rewards(delta, termination_flags, gamma=gamma * lmbda).returns
-    returns = advantages + values
+    gae_advantages = discount_rewards(delta, episode_ends, gamma=gamma * lmbda).returns
+    returns = gae_advantages + values
+    normalized_advantages = normalize(gae_advantages)
     return AdvantageEstimationResult(
         returns=returns,
-        advantages=advantages,
+        advantages=normalized_advantages,
     )
-
-
-def normalize(x: Tensor, dim: int = 0) -> Tensor:
-    return (x - x.mean(dim=dim)) / (torch.std(x, dim=dim, unbiased=False) + 1e-8)

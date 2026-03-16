@@ -18,10 +18,10 @@ class WorkerMock(abstract.AlgoWorkerInterface):
 
 
 def main():
-    env = gym.make('CartPole-v1')
+    env = gym.make("CartPole-v1")
     worker_future = workers.dispatch(
         worker_fn=lambda: WorkerMock(env.action_space),
-        env_fn=lambda: gym.make('CartPole-v1'),
+        env_fn=lambda: gym.make("CartPole-v1"),
         worker_id=0,
         save_root=None,
     )
@@ -29,5 +29,5 @@ def main():
         print(retval)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

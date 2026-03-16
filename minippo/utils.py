@@ -1,6 +1,6 @@
 import statistics as stat
 from collections import defaultdict
-from typing import Dict, List, Union, Iterable
+from typing import Dict, Iterable, List, Union
 
 
 def average_dict_of_floats(metrics_dicts: List[Dict[str, float]]) -> Dict[str, float]:
@@ -14,6 +14,7 @@ def average_dict_of_floats(metrics_dicts: List[Dict[str, float]]) -> Dict[str, f
 class MetricAggregator:
     def __init__(self):
         self.aggregation: Dict[str, List[float]] = defaultdict(list)
+        self._reported_header_after_epoch = -1
 
     def _log_single_metric(self, name: str, value: float):
         self.aggregation[name].append(value)
@@ -49,17 +50,18 @@ class MetricAggregator:
         return report
 
     def _get_header(self, report):
-        header_elements = ["E", "R"] + list(report.keys())
+        header_elements = ["E"] + list(report.keys())
         return "|" + " | ".join(f"{element: ^8}" for element in header_elements) + " |"
 
     def generate_report(self, epoch: int, num_epochs: int, smoothing_window_size: int):
         report = self.get_metrics(smoothing_window_size=smoothing_window_size)
-        if epoch != num_epochs and (
-            epoch % (smoothing_window_size * 10) == 0 or epoch == 1
-        ):
+        _we_need_a_header = epoch // (smoothing_window_size * 10)
+        if _we_need_a_header > self._reported_header_after_epoch:
+            print()
             print(self._get_header(report))
+            self._reported_header_after_epoch = _we_need_a_header
         report_str = [f"{epoch: ^7}"]
-        report_str += [f"{v: >8.4f}" for k, v in report.items()]
+        report_str += [f"{v: >8.3f}" for k, v in report.items()]
         print("\r|", " | ".join(report_str), "|", end="")
         if epoch % smoothing_window_size == 0:
             print()
