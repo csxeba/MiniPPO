@@ -1,71 +1,63 @@
-import gymnasium as gym
+from pathlib import Path
+
 import torch
+import gymnasium as gym
 
-import minippo as ppo
+from minippo.agent import PPO
+from minippo.execution import train
 
-
-def env_fn():
-    raw_env = gym.make("LunarLanding-v1")
-    obs_wrapped_env = gym.wrappers.NormalizeObservation(
-        gym.wrappers.FlattenObservation(raw_env)
-    )
-    wrapped_env = gym.wrappers.TimeLimit(obs_wrapped_env, 200)
-    return wrapped_env
-
-
-def get_actor_fn(env: gym.Env[float, int]):
-    def f():
-        return ppo.network.FFActor[torch.distributions.Categorical](
-            in_features=env.observation_space.shape[0],
-            out_features=env.action_space.n,
-            hiddens=[64, 64],
-            distr_factory=lambda logits: torch.distributions.Categorical(
-                logits=logits, validate_args=False
-            ),
-        )
-
-    return f
-
-
-def actor_optimizer_fn(
-    actor: ppo.network.FFActor[torch.distributions.Categorical],
-) -> torch.optim.Optimizer:
-    return torch.optim.Adam(actor.parameters(), lr=1e-3)
-
-
-def get_critic_fn(env: gym.Env[float, int]):
-    def f():
-        return ppo.network.FFCritic(
-            in_features=env.observation_space.shape[0],
-            hiddens=[64, 64],
-        )
-
-    return f
-
-
-def critic_optimizer_fn(critic: ppo.network.FFCritic) -> torch.optim.Optimizer:
-    return torch.optim.Adam(critic.parameters(), lr=1e-3)
+env_name = "LunarLander-v3"
 
 
 def main():
-    env = env_fn()
-    algo = ppo.algorithm.PPO(
-        actor_building_fn=get_actor_fn(env),
-        actor_optimizer_building_fn=actor_optimizer_fn,
-        critic_building_fn=get_critic_fn(env),
-        critic_optimizer_building_fn=critic_optimizer_fn,
-        ppo_config=ppo.algorithm.Config.from_env(
-            env,
-            critic_num_updates=80,
-            actor_num_updates=80,
-            critic_batch_size=32,
-            actor_batch_size=32,
-            gae_lambda=0.97,
-        ),
+    env = gym.make(env_name)
+    agent_hps = dict(
+        obs_shape = env.observation_space.shape,
+        action_shape=env.action_space.n,
+        gamma=0.999,
+        lam=0.95,  # hyperparameter for GAE
+        ent_coef=0.01,  # coefficient for the entropy bonus (to encourage exploration)
+        actor_hiddens="32-32",
+        critic_hiddens="32-32",
+        actor_lr=3e-4,
+        critic_lr=5e-4,
+        ppo_batch_size=-1,
+        ppo_max_updates=1,
+        ppo_clip_ratio=40.,
     )
-    ppo.executions.train_sync(
-        algo, env_fn, num_workers=32, num_epochs=1000, smoothing_window_size=100
+    training_hps = dict(
+        obs_shape=env.observation_space.shape,
+        action_shape=env.action_space.n,
+        n_envs=10,
+        n_updates=1000,
+        n_steps_per_update=128,
+        num_eval_rollouts=1,
+        report_smoothing_window=10,
     )
+
+    # set the device
+    use_cuda = False
+    if use_cuda:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device("cpu")
+
+    # init the agent
+    agent = PPO(device, agent_hps)
+    train_envs = gym.vector.AsyncVectorEnv(
+        env_fns=[lambda: gym.wrappers.TransformReward(gym.make(env_name), lambda r: r / 100) for _ in range(training_hps["n_envs"])],
+        autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,
+    )
+    train(
+        training_hps,
+        agent,
+        train_envs,
+        eval_env=gym.make(env_name),
+        log_root=Path("logs/")
+    )
+
+
+
 
 
 if __name__ == "__main__":

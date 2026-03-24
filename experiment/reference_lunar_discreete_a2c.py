@@ -1,14 +1,15 @@
 """
-Training A2C with Vector Envs and Domain Randomization
-======================================================
+Speeding up A2C Training with Vector Envs
+=========================================
 
+This tutorial demonstrates training with vector environments to it speed up.
 """
 
 # %%
 # Notice
 # ------
 #
-# If you encounter an RuntimeError like the following comment raised on multiprocessing/spawn.py, wrap up the code from ``gym.vector.make=`` or ``gym.vector.AsyncVectorEnv`` to the end of the code by ``if__name__ == '__main__'``.
+# If you encounter an RuntimeError like the following comment raised on multiprocessing/spawn.py, wrap up the code from ``gym.make_vec=`` or ``gym.vector.AsyncVectorEnv`` to the end of the code by ``if__name__ == '__main__'``.
 #
 # ``An attempt has been made to start a new process before the current process has finished its bootstrapping phase.``
 #
@@ -56,9 +57,7 @@ Training A2C with Vector Envs and Domain Randomization
 
 from __future__ import annotations
 
-import itertools
 import os
-from collections import defaultdict
 
 import numpy as np
 import torch
@@ -180,7 +179,7 @@ class A2C(nn.Module):
         actions = action_pd.sample()
         action_log_probs = action_pd.log_prob(actions)
         entropy = action_pd.entropy()
-        return (actions, action_log_probs, state_values, entropy)
+        return actions, action_log_probs, state_values, entropy
 
     def get_losses(
         self,
@@ -252,39 +251,6 @@ class A2C(nn.Module):
         actor_loss.backward()
         self.actor_optim.step()
 
-    def validation_epoch(self, _env, n_rollouts: int) -> dict[str, float]:
-        self.eval()
-        _report = defaultdict(list)
-        with torch.no_grad(), torch.inference_mode():
-            for _ in range(n_rollouts):
-                _obs, _info = _env.reset()
-                _rollout_reward = 0.0
-                _steps_iter = itertools.count()
-                _values = 0.
-                _entropies = 0.
-                for _step in _steps_iter:
-                    _obs = _obs[None, ...]
-                    _act, _act_lp, _value, _entropy = self.select_action(
-                        _obs
-                    )
-
-                    # perform the action A_{t} in the environment to get S_{t+1} and R_{t+1}
-                    _obs, _rew, _term, _trunc, _info = _env.step(
-                        _act.cpu().numpy().item()
-                    )
-
-                    _rollout_reward += _rew
-                    _values += _value
-                    _entropies += _entropy
-                    if _trunc or _term:
-                        break
-                _max_step = next(_steps_iter)
-                _report["S"].append(_max_step)
-                _report["R"].append(_rollout_reward)
-                _report["V"].append(_values / _max_step)
-                _report["ent"].append(_entropy / _max_step)
-        return {k: np.mean(v).item() for k, v in _report.items()}
-
 
 # %%
 # Using Vectorized Environments
@@ -301,7 +267,8 @@ class A2C(nn.Module):
 # The simplest way to create vector environments is by calling `gym.vector.make`, which creates multiple instances of the same environment:
 #
 
-envs = gym.vector.AsyncVectorEnv([lambda: gym.make("LunarLander-v3") for _ in range(3)])
+envs = gym.make_vec("LunarLander-v3", num_envs=3, max_episode_steps=600)
+
 
 # %%
 # Domain Randomization
@@ -313,7 +280,7 @@ envs = gym.vector.AsyncVectorEnv([lambda: gym.make("LunarLander-v3") for _ in ra
 # Manually setting up 3 parallel 'LunarLander-v3' envs with different parameters:
 
 
-envs = gym.vector.AsyncVectorEnv(
+envs = gym.vector.SyncVectorEnv(
     [
         lambda: gym.make(
             "LunarLander-v3",
@@ -346,7 +313,7 @@ envs = gym.vector.AsyncVectorEnv(
 #
 
 
-envs = gym.vector.AsyncVectorEnv(
+envs = gym.vector.SyncVectorEnv(
     [
         lambda: gym.make(
             "LunarLander-v3",
@@ -425,12 +392,12 @@ if randomize_domain:
     )
 
 else:
-    envs = gym.vector.AsyncVectorEnv([lambda: gym.make("LunarLander-v3") for _ in range(n_envs)])
+    envs = gym.make_vec("LunarLander-v3", num_envs=n_envs, max_episode_steps=600)
 
+print(envs.autoreset_mode)
 
 obs_shape = envs.single_observation_space.shape[0]
 action_shape = envs.single_action_space.n
-eval_env = gym.make("LunarLander-v3")
 
 # set the device
 use_cuda = False
@@ -458,15 +425,16 @@ agent = A2C(obs_shape, action_shape, device, critic_lr, actor_lr, n_envs)
 #
 
 # create a wrapper environment to save episode returns and episode lengths
+envs_wrapper = gym.wrappers.vector.RecordEpisodeStatistics(
+    envs, buffer_length=n_envs * n_updates
+)
 
 critic_losses = []
 actor_losses = []
 entropies = []
-report_header = ["S", "R", "V", "ent"]
-report_header_str = "|" + f"{'E': ^10}" + " | ".join(f"{element: ^10}" for element in report_header) + " |"
 
 # use tqdm to get a progress bar for training
-for sample_phase in range(n_updates):
+for sample_phase in tqdm(range(n_updates)):
     # we don't have to reset the envs, they just continue playing
     # until the episode is over and then reset automatically
 
@@ -478,7 +446,7 @@ for sample_phase in range(n_updates):
 
     # at the start of training reset all envs to get an initial state
     if sample_phase == 0:
-        states, info = envs.reset(seed=42)
+        states, info = envs_wrapper.reset(seed=42)
 
     # play n steps in our parallel environments to collect data
     for step in range(n_steps_per_update):
@@ -488,7 +456,7 @@ for sample_phase in range(n_updates):
         )
 
         # perform the action A_{t} in the environment to get S_{t+1} and R_{t+1}
-        states, rewards, terminated, truncated, infos = envs.step(
+        states, rewards, terminated, truncated, infos = envs_wrapper.step(
             actions.cpu().numpy()
         )
 
@@ -520,18 +488,6 @@ for sample_phase in range(n_updates):
     critic_losses.append(critic_loss.detach().cpu().numpy())
     actor_losses.append(actor_loss.detach().cpu().numpy())
     entropies.append(entropy.detach().mean().cpu().numpy())
-
-    if sample_phase == 0:
-        print()
-        print(report_header_str)
-    report = agent.validation_epoch(eval_env, n_rollouts=1)
-    E_str = f"{sample_phase}/{n_updates}"
-    report_str = [f"{E_str: >10}"]
-    report_str += [f"{report[k]: >10.3f}" for k in report_header]
-    report_str = "".join(["|", " | ".join(report_str), "|"])
-    if sample_phase % 10 == 0:
-        print(report_header_str)
-    print(report_str)
 
 
 # %%
@@ -664,6 +620,11 @@ plt.show()
 #
 
 
+# %%
+# Saving/ Loading Weights
+# -----------------------
+#
+
 save_weights = False
 load_weights = False
 
@@ -673,10 +634,13 @@ critic_weights_path = "weights/critic_weights.h5"
 if not os.path.exists("weights"):
     os.mkdir("weights")
 
+""" save network weights """
 if save_weights:
     torch.save(agent.actor.state_dict(), actor_weights_path)
     torch.save(agent.critic.state_dict(), critic_weights_path)
 
+
+""" load network weights """
 if load_weights:
     agent = A2C(obs_shape, action_shape, device, critic_lr, actor_lr)
 
@@ -685,6 +649,13 @@ if load_weights:
     agent.actor.eval()
     agent.critic.eval()
 
+
+# %%
+# Showcase the Agent
+# ------------------
+#
+
+""" play a couple of showcase episodes """
 
 n_showcase_episodes = 3
 
@@ -728,3 +699,25 @@ for episode in range(n_showcase_episodes):
         done = terminated or truncated
 
 env.close()
+
+
+# %%
+# Try playing the environment yourself
+# ------------------------------------
+#
+
+# from gymnasium.utils.play import play
+#
+# play(gym.make('LunarLander-v3', render_mode='rgb_array'),
+#     keys_to_action={'w': 2, 'a': 1, 'd': 3}, noop=0)
+
+
+# %%
+# References
+# ----------
+#
+# [1] V. Mnih, A. P. Badia, M. Mirza, A. Graves, T. P. Lillicrap, T. Harley, D. Silver, K. Kavukcuoglu. "Asynchronous Methods for Deep Reinforcement Learning" ICML (2016).
+#
+# [2] J. Schulman, P. Moritz, S. Levine, M. Jordan and P. Abbeel. "High-dimensional continuous control using generalized advantage estimation." ICLR (2016).
+#
+# [3] Gymnasium Documentation: Vector environments. (URL: https://gymnasium.farama.org/api/vector/)
