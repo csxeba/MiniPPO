@@ -188,7 +188,7 @@ def train(
 
 def validation_epoch(
     agent: ActorCritic,
-    _env,
+    env,
     n_rollouts: int,
 ) -> dict[str, float]:
         agent.actor.eval()
@@ -196,23 +196,23 @@ def validation_epoch(
         report = defaultdict(list)
         with torch.no_grad(), torch.inference_mode():
             for _ in range(n_rollouts):
-                obs, info = _env.reset()
+                obs, info = env.reset()
                 rollout_reward = 0.0
                 steps_iter = itertools.count()
                 values = 0.
                 entropies = 0.
                 for _ in steps_iter:
-                    obs = torch.tensor(obs, device=agent.device)[None, ...]
-                    act_logits = agent.actor(obs)
-                    value = agent.critic(obs)
+                    obs = torch.tensor(obs, device=agent.device)
+                    act_logits = agent.actor(obs[None, None, ...])[0, 0, ...]
+                    value = agent.critic(obs[None, None, ...])[0, 0, ...]
                     act_pd = torch.distributions.Categorical(logits=act_logits)
                     act = act_pd.sample()
                     entropy = act_pd.entropy()
-                    obs, rew, term, trunc, info = _env.step(
+                    obs, rew, term, trunc, info = env.step(
                         act.cpu().numpy().item()
                     )
                     rollout_reward += rew
-                    values += value.squeeze(1).cpu().item()
+                    values += value.squeeze().cpu().item()
                     entropies += entropy.mean().cpu().item()
                     if trunc or term:
                         break
