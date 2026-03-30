@@ -1,13 +1,13 @@
 import dataclasses
-from typing import Any
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
-import gymnasium as gym
 import torch
 from torch import nn
 from torch import optim
 from torch.nn import functional as F
+from torch.optim import Optimizer
 
 from minippo import util
 
@@ -22,6 +22,7 @@ def _make_mlp(obs_shape: tuple[int, ...], hiddens: tuple[int, ...], output_shape
     layers.append(nn.Linear(hiddens[-1], output_shape))
     mlp = nn.Sequential(*layers)
     return mlp
+
 
 def calculate_gae(
     rewards: torch.Tensor,  # Shape: (T, n_envs)
@@ -53,18 +54,34 @@ class ActorCritic:
         self,
         device: torch.device,
         config: dict,
+        actor_fn: Callable[[], nn.Module] | None = None,
+        critic_fn: Callable[[], nn.Module] | None = None,
+        actor_optim_fn: Callable[[], Optimizer] | None = None,
+        critic_optim_fn: Callable[[], Optimizer] | None = None,
     ) -> None:
         """Initializes the actor and critic networks and their respective optimizers."""
         super().__init__()
         self.device = device
-        actor_hiddens = tuple(int(h) for h in config["actor_hiddens"].split("-"))
-        critic_hiddens = tuple(int(h) for h in config["critic_hiddens"].split("-"))
-        self.critic = _make_mlp(config["obs_shape"], critic_hiddens, 1).to(self.device)
-        self.actor = _make_mlp(config["obs_shape"], actor_hiddens, config["action_shape"]).to(self.device)
+        if actor_fn is None:
+            actor_hiddens = tuple(int(h) for h in config["actor_hiddens"].split("-"))
+            self.actor = DeepSet(config["obs_shape"], actor_hiddens, config["action_shape"]).to(self.device)
+        else:
+            self.actor = actor_fn()
+        if critic_fn is None:
+            critic_hiddens = tuple(int(h) for h in config["critic_hiddens"].split("-"))
+            self.critic = DeepSet(config["obs_shape"], critic_hiddens, 1).to(self.device)
+        else:
+            self.critic = critic_fn()
 
         # define optimizers for actor and critic
-        self.critic_optim = optim.RMSprop(self.critic.parameters(), lr=config["critic_lr"])
-        self.actor_optim = optim.RMSprop(self.actor.parameters(), lr=config["actor_lr"])
+        if actor_optim_fn is None:
+            self.actor_optim = optim.RMSprop(self.actor.parameters(), lr=config["actor_lr"])
+        else:
+            self.actor_optim = actor_optim_fn()
+        if critic_optim_fn is None:
+            self.critic_optim = optim.RMSprop(self.critic.parameters(), lr=config["critic_lr"])
+        else:
+            self.critic_optim = critic_optim_fn()
 
         self.cfg = config
 
@@ -104,6 +121,7 @@ class ActorCritic:
         action_log_probs: torch.Tensor,
         rewards: torch.Tensor,
         masks: torch.Tensor,
+        valid_transitions: torch.Tensor,
     ) -> LossOutput:
         raise NotImplementedError
 
@@ -118,6 +136,7 @@ class A2C(ActorCritic):
         action_log_probs: torch.Tensor,
         rewards: torch.Tensor,
         masks: torch.Tensor,
+        valid_transitions: torch.Tensor,
     ) -> LossOutput:
         self.actor.train()
         self.critic.train()
@@ -129,7 +148,8 @@ class A2C(ActorCritic):
             self.cfg["gamma"],
             self.cfg["lam"],
         )
-        critic_loss = torch.square(advantages).mean()
+        n_valid = valid_transitions.sum()
+        critic_loss = (torch.square(advantages) * valid_transitions).sum() / n_valid
         action_pd = torch.distributions.Categorical(logits=self.actor(observations))
         actor_loss = -(advantages.detach() * action_pd.log_prob(actions)).mean()
         entropy_bonus = -action_pd.entropy().mean()
@@ -160,6 +180,7 @@ class PPO(ActorCritic):
         action_log_probs: torch.Tensor,
         rewards: torch.Tensor,
         masks: torch.Tensor,
+        valid_transitions: torch.Tensor,
     ) -> LossOutput:
         self.actor.eval()
         self.critic.eval()
@@ -172,7 +193,7 @@ class PPO(ActorCritic):
         time, n_envs = rewards.shape
 
         with torch.no_grad():
-            value_preds = self.critic(observations).squeeze(2)
+            value_preds = self.critic(observations).squeeze(-1)
             advantages = calculate_gae(
                 rewards,
                 value_preds,
@@ -188,6 +209,7 @@ class PPO(ActorCritic):
             advantages = advantages.view(-1)
             returns = value_preds.view(-1) + advantages
             masks = masks.view(-1)
+            valid_transitions = valid_transitions.view(-1)
 
         batch_stream = util.stream_batched_indices(
             max_index=time * n_envs,
@@ -209,6 +231,8 @@ class PPO(ActorCritic):
             batch_adv = advantages[batched_indices] * batch_masks
             batch_ret = returns[batched_indices] * batch_masks
             batch_old_log_probs = old_action_lps[batched_indices]
+            batch_valid_transitions = valid_transitions[batched_indices]
+            n_valid = batch_valid_transitions.sum()
 
             values = self.critic(batch_obs).squeeze(-1)
             logits = self.actor(batch_obs)
@@ -218,9 +242,9 @@ class PPO(ActorCritic):
             ratio = torch.exp(log_probs - batch_old_log_probs)
             surrogate1 = ratio * batch_adv
             surrogate2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * batch_adv
-            actor_loss = -(torch.min(surrogate1, surrogate2).mean())
-            entropy_bonus = -actor_pd.entropy().mean()
-            critic_loss = F.mse_loss(values, batch_ret, reduction="mean")
+            actor_loss = -((torch.min(surrogate1, surrogate2)) * batch_valid_transitions).sum() / n_valid
+            entropy_bonus = -(actor_pd.entropy() * batch_valid_transitions).sum() / n_valid
+            critic_loss = (F.mse_loss(values, batch_ret, reduction="none") * batch_valid_transitions).sum() / n_valid
 
             self.update_parameters(
                 actor_loss=actor_loss + self.cfg["ent_coef"] * entropy_bonus,

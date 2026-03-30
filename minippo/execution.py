@@ -1,6 +1,6 @@
 import dataclasses
 from collections import defaultdict, deque
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 from pathlib import Path
 import itertools
 
@@ -9,7 +9,7 @@ import gymnasium as gym
 import pandas as pd
 import torch
 
-from minippo.agent import ActorCritic, LossOutput
+from minippo.agent import ActorCritic
 
 
 @dataclasses.dataclass
@@ -20,6 +20,7 @@ class TrainData:
     action_log_probs: torch.Tensor
     rewards: torch.Tensor
     masks: torch.Tensor
+    valid_transitions: torch.Tensor
     _steps_written: set
 
     @classmethod
@@ -39,8 +40,17 @@ class TrainData:
             action_log_probs=torch.zeros(n_steps_per_update, n_envs, device=device, dtype=torch.float32),
             rewards=torch.zeros(n_steps_per_update, n_envs, device=device, dtype=torch.float32),
             masks=torch.zeros(n_steps_per_update, n_envs, device=device, dtype=torch.float32),
+            valid_transitions=torch.zeros(n_steps_per_update, n_envs, device=device, dtype=torch.float32),
             _steps_written=set(),
         )
+
+    @property
+    def n_steps(self) -> int:
+        return self.observations.shape[0]
+
+    @property
+    def n_envs(self) -> int:
+        return self.observations.shape[1]
 
     def push(
         self,
@@ -51,9 +61,9 @@ class TrainData:
         action_log_prob: torch.Tensor,
         reward: torch.Tensor,
         mask: torch.Tensor,
+        valid_transition: torch.Tensor,
     ):
-        n_steps_per_update = len(self.observations)
-        assert step < n_steps_per_update
+        assert step < self.n_steps
         assert step not in self._steps_written
         self._steps_written.add(step)
         self.observations[step] = obs
@@ -62,6 +72,7 @@ class TrainData:
         self.action_log_probs[step] = action_log_prob
         self.rewards[step] = torch.tensor(reward, dtype=self.rewards.dtype)
         self.masks[step] = torch.tensor(mask, dtype=self.masks.dtype)
+        self.valid_transitions[step] = torch.tensor(valid_transition, dtype=self.valid_transitions.dtype)
 
     def pull(self) -> dict[str, torch.Tensor]:
         data = {f.name: getattr(self, f.name) for f in dataclasses.fields(self) if f.type == torch.Tensor}
@@ -71,22 +82,27 @@ class TrainData:
         return data
 
 
+class LastState(NamedTuple):
+    observation: np.ndarray
+    valid_transition: np.ndarray
+
+
 def collect_train_data(
     actor: Callable[[torch.Tensor], torch.Tensor],
     train_envs: gym.vector.AsyncVectorEnv,
     training_hps: dict[str, Any],
+    last_state: LastState,
     device: torch.device,
-    obs: np.ndarray,
-) -> tuple[TrainData, np.ndarray]:
+) -> tuple[TrainData, LastState]:
 
-    assert train_envs.autoreset_mode == gym.vector.vector_env.AutoresetMode.SAME_STEP
+    # assert train_envs.autoreset_mode == gym.vector.vector_env.AutoresetMode.SAME_STEP
 
     n_steps_per_update = training_hps["n_steps_per_update"]
     data = TrainData.make_empty(training_hps, device)
-
+    obs, valid_transition = last_state
     for step in range(n_steps_per_update):
         obs = torch.tensor(obs, device=device, dtype=torch.float32)
-        action_logits = actor(obs)
+        action_logits = actor(obs.unsqueeze(0)).squeeze(0)
         action_pd = torch.distributions.Categorical(logits=action_logits)
         actions = action_pd.sample()
         action_log_probs = action_pd.log_prob(actions)
@@ -95,38 +111,45 @@ def collect_train_data(
             actions.cpu().numpy()
         )
         mask = torch.tensor([not term for term in terminated])
-        data.push(step, obs, action_logits, actions, action_log_probs, rewards, mask)
+        data.push(step, obs, action_logits, actions, action_log_probs, rewards, mask, valid_transition)
 
         obs = next_obs
+        valid_transition = torch.tensor([not (term or trunc) for term, trunc in zip(terminated, truncated)])
 
-    return data, obs
+    return data, LastState(obs, valid_transition=valid_transition)
 
 
 def train(
     train_hps: dict[str, Any],
     agent: ActorCritic,
-    train_vec_env: gym.vector.AsyncVectorEnv,
+    train_vec_env: gym.vector.VectorEnv,
     eval_env: gym.Env,
     log_root: Path,
+    checkpoints_root: Path,
 ):
     rolling_report = defaultdict(lambda: deque(maxlen=train_hps["report_smoothing_window"]))
     best_reward = -np.inf
     reports_for_saving = []
     log_root.mkdir(parents=True, exist_ok=True)
+    checkpoints_root.mkdir(parents=True, exist_ok=True)
 
     n_updates = train_hps["n_updates"]
+    n_envs = train_hps["n_envs"]
     obs, _ = train_vec_env.reset()
-
+    last_state = LastState(
+        observation=obs,
+        valid_transition=np.ones(n_envs, dtype=bool),
+    )
     try:
         for sample_phase in range(n_updates):
 
             # train step
-            train_data, obs = collect_train_data(
+            train_data, last_state = collect_train_data(
                 actor=agent.actor,
                 train_envs=train_vec_env,
                 training_hps=train_hps,
+                last_state=last_state,
                 device=agent.device,
-                obs=obs,
             )
             loss_output = agent.get_losses(**train_data.pull())
 
@@ -152,11 +175,11 @@ def train(
             print(report_str, end="")
 
             # checkpointing
-            best_save_path = Path("checkpoints/best_agent.pt")
+            best_save_path = checkpoints_root / "best_agent.pt"
             if report["R"] > best_reward:
                 agent.save(best_save_path, metrics_dict=report)
                 best_reward = report["R"]
-            latest_save_path = Path("checkpoints/latest_agent.pt")
+            latest_save_path = checkpoints_root / "latest_agent.pt"
             agent.save(latest_save_path, metrics_dict=report)
     finally:
         pd.DataFrame(rolling_report).to_csv(log_root / "metric_logs.csv")
@@ -201,26 +224,16 @@ def validation_epoch(
         return {k: np.mean(v).item() for k, v in report.items()}
 
 
-def plot():
-    env = gym.make("LunarLander-v3", render_mode="human")
-    if which != "random":
-        save_path = Path(f"checkpoints/{which}.pt")
-        assert save_path.exists()
-        checkpoint = torch.load(save_path)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        agent = A2C(device, checkpoint["config"])
-        agent.load(save_path)
-
+def plot(agent: ActorCritic, env: gym.Env):
     while 1:
-        observation, info = env.reset()
+        obs, info = env.reset()
         for _ in itertools.count():
             env.render()
-            if which == "random":
-                action = env.action_space.sample()
-                observation, reward, terminated, truncated, info = env.step(action)
-            else:
-                observation = torch.from_numpy(observation).float().to(device).unsqueeze(0)
-                actions, action_log_probs, state_value_preds, entropy = agent.select_action(observation)
-                observation, reward, terminated, truncated, info = env.step(actions.squeeze(-1).cpu().numpy())
+            obs = torch.tensor(obs, device=agent.device)[None, ...]
+            act_logits = agent.actor(obs).squeeze(0)
+            act_pd = torch.distributions.Categorical(logits=act_logits)
+            act = act_pd.sample()
+
+            obs, reward, terminated, truncated, info = env.step(act.squeeze(-1).cpu().item())
             if terminated or truncated:
-                break
+                    break

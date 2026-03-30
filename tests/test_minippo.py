@@ -3,8 +3,9 @@ import random
 import gymnasium as gym
 import numpy as np
 import torch
+from torch.utils.benchmark.utils.fuzzer import dtype_size
 
-from minippo.execution import collect_train_data
+from minippo.execution import collect_train_data, LastState
 from minippo.agent import LossOutput
 
 
@@ -51,11 +52,12 @@ def test_training_step():
     n_steps = 50
     n_envs = 3
 
-    vec_env = gym.vector.AsyncVectorEnv([DummyEnv for _ in range(n_envs)], autoreset_mode=gym.vector.AutoresetMode.SAME_STEP)
+    vec_env = gym.vector.AsyncVectorEnv([DummyEnv for _ in range(n_envs)], autoreset_mode=gym.vector.AutoresetMode.NEXT_STEP)
     actor = DummyActor(DummyEnv())
 
     obs, info = vec_env.reset()
-    train_data, obs = collect_train_data(
+    last_state = LastState(obs, valid_transition=np.ones(n_envs, dtype=bool))
+    train_data, last_state = collect_train_data(
         actor=actor,
         train_envs=vec_env,
         training_hps={
@@ -65,7 +67,7 @@ def test_training_step():
             "obs_shape": vec_env.single_observation_space.shape,
         },
         device=torch.device("cpu"),
-        obs=obs,
+        last_state=last_state,
     )
 
     assert len(train_data.observations) == len(train_data.rewards) == len(train_data.masks) == n_steps
@@ -75,20 +77,19 @@ def test_training_step():
         env_max_steps = info["max_steps"][env_idx]
         env_obs = train_data.observations[:, env_idx]
         env_reward = train_data.rewards[:, env_idx]
-        env_mask = train_data.masks[:, env_idx]
+        env_is_valid = train_data.valid_transitions[:, env_idx]
         assert all(env_obs) < env_max_steps
         assert all(env_reward) < env_max_steps
 
         # Check time alignement
         rollout_start = 0
-        rollout_ends = list(np.where(env_mask == 0)[0] + 1)
-        rollout_ends.append(env_max_steps)
-        for rollout_end in rollout_ends:
+        rollout_starts = list(np.where(env_is_valid == 0)[0])
+        for rollout_end in rollout_starts:
             # reward should be shifted by 1 compared to obs
             rollout_obs = env_obs[rollout_start:rollout_end].squeeze(1)
             rollout_rwd = env_reward[rollout_start:rollout_end]
-            rollout_mask = env_mask[rollout_start:rollout_end]
+            rollout_valid = env_is_valid[rollout_start:rollout_end].bool()
             rollout_dif = rollout_rwd - rollout_obs
-            assert all(rollout_dif == 1)
+            assert all(rollout_dif[rollout_valid] == 1)
             rollout_start = rollout_end
 
