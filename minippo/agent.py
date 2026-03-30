@@ -234,8 +234,8 @@ class PPO(ActorCritic):
             batch_valid_transitions = valid_transitions[batched_indices]
             n_valid = batch_valid_transitions.sum()
 
-            values = self.critic(batch_obs).squeeze(-1)
-            logits = self.actor(batch_obs)
+            values = self.critic(batch_obs.unsqueeze(0)).squeeze(0).squeeze(-1)
+            logits = self.actor(batch_obs.unsqueeze(0)).squeeze(0)
 
             actor_pd = torch.distributions.Categorical(logits=logits)
             log_probs = actor_pd.log_prob(batch_act)

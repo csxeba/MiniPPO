@@ -1,3 +1,4 @@
+import copy
 import dataclasses
 from pathlib import Path
 import sys
@@ -52,7 +53,7 @@ class DeepSet(nn.Module):
         output_shape: int,
     ) -> None:
         super().__init__()
-        assert len(obs_shape) == 2
+        assert len(obs_shape) == 3
         fan_in = obs_shape[-1]
         proj_mlp_layers = [
             nn.Linear(fan_in, proj_hiddens[0]),
@@ -66,7 +67,7 @@ class DeepSet(nn.Module):
             proj_mlp_layers.append(nn.BatchNorm1d(h1))
             h0 = h1
         output_layers = [
-            nn.Linear(h0, output_hiddens[0]),
+            nn.Linear(h0*2, output_hiddens[0]),
             nn.ReLU(),
             nn.BatchNorm1d(output_hiddens[0]),
         ]
@@ -78,23 +79,27 @@ class DeepSet(nn.Module):
             h0 = h1
         output_layers.append(nn.Linear(h0, output_shape))
 
-        self.proj_mlp = nn.Sequential(*proj_mlp_layers)
+        self.proj_mlp_past = nn.Sequential(*proj_mlp_layers)
+        self.proj_mlp_present = nn.Sequential(*copy.deepcopy(proj_mlp_layers))
         self.output_mlp = nn.Sequential(*output_layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        *dims, fan_in = x.shape
-        views = self.proj_mlp(x.view(-1, fan_in)).view(*dims, -1)  # [B, n, in] -> [B, n, out]
-        views = views.mean(dim=-2)
-        *dims, fan_in = views.shape
-        out = self.output_mlp(views.view(-1, fan_in)).view(*dims, -1)
+        b, n_env, n_frame, n_obj, fan_in = x.shape
+        past, present = x[:, :, 0].reshape(-1, fan_in), x[:, :, 1].reshape(-1, fan_in)
+        view_past = self.proj_mlp_past(past).view(b*n_env, n_obj, -1)
+        view_present = self.proj_mlp_present(present).view(b*n_env, n_obj, -1)
+        views = torch.cat([view_past.mean(dim=-2), view_present.mean(dim=-2)], dim=-1)
+        fan_in = views.shape[-1]
+        out = self.output_mlp(views.view(-1, fan_in)).view(b, n_env, -1)
         return out
 
 
-
-
 def env_fn(**kwargs):
-    env = Reskiv(ReskivConfig(observation_type="coords"))
-    env = ObservationTransform(env, max_len=20)
+    maxlen = 20
+    framestack = 2
+    env = Reskiv(ReskivConfig(observation_type="coords", time_limit=1000))
+    env = ObservationTransform(env, max_len=maxlen)
+    env = gym.wrappers.FrameStackObservation(env, stack_size=framestack)
     return env
 
 
@@ -119,22 +124,22 @@ env = env_fn()
 agent_hps = AgentHPs(
     obs_shape=tuple(env.observation_space.shape),
     action_shape=env.action_space.n,
-    gamma=0.999,
-    lam=0.98,  # hyperparameter for GAE
+    gamma=0.99,
+    lam=0.95,  # hyperparameter for GAE
     ent_coef=0.01,  # coefficient for the entropy bonus (to encourage exploration)
     actor_hiddens=(32, 32),
     critic_hiddens=(32, 32),
-    actor_lr=3e-4,  # 0.0001
-    critic_lr=5e-4,  # 0.0005
+    actor_lr=1e-4,  # 0.0001
+    critic_lr=3e-4,  # 0.0005
     ppo_batch_size=32,
-    ppo_max_updates=32,
+    ppo_max_updates=5*(128*16),
     ppo_clip_ratio=0.2,
 )
 
 training_hps = dict(
     obs_shape=env.observation_space.shape,
     action_shape=env.action_space.n,
-    n_envs=32,
+    n_envs=16,
     n_updates=1000,
     n_steps_per_update=128,
     num_eval_rollouts=1,
