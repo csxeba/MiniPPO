@@ -9,7 +9,7 @@ import gymnasium as gym
 import pandas as pd
 import torch
 
-from minippo.agent import ActorCritic
+from minippo.agent import PPO
 
 
 @dataclasses.dataclass
@@ -88,8 +88,8 @@ class LastState(NamedTuple):
 
 
 def collect_train_data(
-    actor: Callable[[torch.Tensor], torch.Tensor],
-    train_envs: gym.vector.AsyncVectorEnv,
+    agent: PPO,
+    train_envs: gym.vector.VectorEnv,
     training_hps: dict[str, Any],
     last_state: LastState,
     device: torch.device,
@@ -102,7 +102,7 @@ def collect_train_data(
     obs, valid_transition = last_state
     for step in range(n_steps_per_update):
         obs = torch.tensor(obs, device=device, dtype=torch.float32)
-        action_logits = actor(obs.unsqueeze(0)).squeeze(0)
+        action_logits = agent(obs).action_logit  # expand batch dim
         action_pd = torch.distributions.Categorical(logits=action_logits)
         actions = action_pd.sample()
         action_log_probs = action_pd.log_prob(actions)
@@ -121,7 +121,7 @@ def collect_train_data(
 
 def train(
     train_hps: dict[str, Any],
-    agent: ActorCritic,
+    agent: PPO,
     train_vec_env: gym.vector.VectorEnv,
     eval_env: gym.Env,
     log_root: Path,
@@ -140,17 +140,23 @@ def train(
         observation=obs,
         valid_transition=np.ones(n_envs, dtype=bool),
     )
+    printed_first = False
     try:
         for sample_phase in range(n_updates):
 
             # train step
             train_data, last_state = collect_train_data(
-                actor=agent.actor,
+                agent=agent,
                 train_envs=train_vec_env,
                 training_hps=train_hps,
                 last_state=last_state,
                 device=agent.device,
             )
+            if not printed_first:
+                print(train_data.observations[0, 0])
+                printed_first = True
+            # print(train_data.observations[0, 0])
+
             loss_output = agent.get_losses(**train_data.pull())
 
             # reporting
@@ -163,7 +169,7 @@ def train(
             reports_for_saving.append(report)
             for k, v in report.items():
                 rolling_report[k].append(v)
-            E_str = f"{sample_phase}/{n_updates}"
+            E_str = f"{sample_phase+1}/{n_updates}"
             report_str = [f"{E_str: >10}"]
             report_str += [f"{np.mean(v): >10.3f}" for k, v in rolling_report.items() if k != "E"]
             report_str = "\r" + "".join(["|", " | ".join(report_str), " |"])
@@ -187,53 +193,61 @@ def train(
 
 
 def validation_epoch(
-    agent: ActorCritic,
+    agent: PPO,
     env,
     n_rollouts: int,
 ) -> dict[str, float]:
-        agent.actor.eval()
-        agent.critic.eval()
-        report = defaultdict(list)
-        with torch.no_grad(), torch.inference_mode():
-            for _ in range(n_rollouts):
-                obs, info = env.reset()
-                rollout_reward = 0.0
-                steps_iter = itertools.count()
-                values = 0.
-                entropies = 0.
-                for _ in steps_iter:
-                    obs = torch.tensor(obs, device=agent.device)
-                    act_logits = agent.actor(obs[None, None, ...])[0, 0, ...]
-                    value = agent.critic(obs[None, None, ...])[0, 0, ...]
-                    act_pd = torch.distributions.Categorical(logits=act_logits)
-                    act = act_pd.sample()
-                    entropy = act_pd.entropy()
-                    obs, rew, term, trunc, info = env.step(
-                        act.cpu().numpy().item()
-                    )
-                    rollout_reward += rew
-                    values += value.squeeze().cpu().item()
-                    entropies += entropy.mean().cpu().item()
-                    if trunc or term:
-                        break
-                max_step = next(steps_iter)
-                report["S"].append(max_step)
-                report["R"].append(rollout_reward)
-                report["V"].append(values / max_step)
-                report["ent"].append(entropies / max_step)
-        return {k: np.mean(v).item() for k, v in report.items()}
+    agent.eval()
+    report = defaultdict(list)
+    with torch.no_grad(), torch.inference_mode():
+        for _ in range(n_rollouts):
+            obs, info = env.reset()
+            rollout_reward = 0.0
+            steps_iter = itertools.count()
+            values = 0.
+            entropies = 0.
+            for _ in steps_iter:
+                obs = torch.tensor(obs, device=agent.device)
+                act_logits, value = agent(obs[None, ...])
+                act_pd = torch.distributions.Categorical(logits=act_logits.squeeze(0))
+                act = act_pd.sample()
+                entropy = act_pd.entropy()
+                obs, rew, term, trunc, info = env.step(
+                    act.cpu().numpy().item()
+                )
+                rollout_reward += rew
+                values += value.squeeze().cpu().item()
+                entropies += entropy.mean().cpu().item()
+                if trunc or term:
+                    break
+            max_step = next(steps_iter)
+            report["S"].append(max_step)
+            report["R"].append(rollout_reward)
+            report["V"].append(values / max_step)
+            report["ent"].append(entropies / max_step)
+    return {k: np.mean(v).item() for k, v in report.items()}
 
 
-def plot(agent: ActorCritic, env: gym.Env):
+@torch.inference_mode
+def plot(agent: PPO, env: gym.Env, temperature: float = 1.0):
+    agent.eval()
     while 1:
         obs, info = env.reset()
         for _ in itertools.count():
             env.render()
-            obs = torch.tensor(obs, device=agent.device)[None, ...]
-            act_logits = agent.actor(obs).squeeze(0)
-            act_pd = torch.distributions.Categorical(logits=act_logits)
+            obs = torch.tensor(obs, device=agent.device)
+            act_logits = agent.forward_actor(obs[None, None, ...])[0, 0, ...]  # expand batch and num. envs to 1
+            act_logits_tempered = act_logits / temperature
+            act_pd = torch.distributions.Categorical(logits=act_logits_tempered)
             act = act_pd.sample()
+            obs, *_ = env.step(
+                act.cpu().numpy().item()
+            )
 
             obs, reward, terminated, truncated, info = env.step(act.squeeze(-1).cpu().item())
             if terminated or truncated:
-                    break
+                np.save("last_logits.npy", act_logits.numpy())
+                np.save("last_obs.npy", obs)
+                np.save("last_canvas.npy", env.unwrapped._canvas)
+                break
+
