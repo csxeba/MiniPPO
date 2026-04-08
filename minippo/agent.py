@@ -54,10 +54,12 @@ class PPO(nn.Module):
         actor_critic_optim_fn: Callable[[], Optimizer],
     ) -> None:
         super().__init__()
-        self.device = device
         self.actor_critic = actor_critic_fn()
         self.actor_critic_opt = actor_critic_optim_fn()
         self.cfg = config
+
+        self.device = device
+        self.to(device)
 
         # Delegate these
         self.train = self.actor_critic.train
