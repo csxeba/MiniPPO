@@ -82,7 +82,6 @@ class DeepSet(ActorCritic):
         return ActorCriticOutput(action_logit, value)
 
 
-
 def env_fn(**kwargs):
     env_config = {
         "canvas_shape": (320, 320),

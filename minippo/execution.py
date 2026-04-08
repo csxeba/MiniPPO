@@ -92,16 +92,15 @@ def collect_train_data(
     train_envs: gym.vector.VectorEnv,
     training_hps: dict[str, Any],
     last_state: LastState,
-    device: torch.device,
 ) -> tuple[TrainData, LastState]:
 
     # assert train_envs.autoreset_mode == gym.vector.vector_env.AutoresetMode.SAME_STEP
 
     n_steps_per_update = training_hps["n_steps_per_update"]
-    data = TrainData.make_empty(training_hps, device)
+    data = TrainData.make_empty(training_hps, agent.device)
     obs, valid_transition = last_state
     for step in range(n_steps_per_update):
-        obs = torch.tensor(obs, device=device, dtype=torch.float32)
+        obs = torch.tensor(obs, device=agent.device, dtype=torch.float32)
         action_logits = agent(obs).action_logit  # expand batch dim
         action_pd = torch.distributions.Categorical(logits=action_logits)
         actions = action_pd.sample()
@@ -189,7 +188,7 @@ def train(
             agent.save(latest_save_path, metrics_dict=report)
     finally:
         pd.DataFrame(rolling_report).to_csv(log_root / "metric_logs.csv")
-        print(f"Saved metric logs to {log_root}")
+        print(f"\nSaved metric logs to {log_root}")
 
 
 def validation_epoch(
