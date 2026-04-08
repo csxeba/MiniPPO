@@ -1,19 +1,16 @@
-import copy
 import dataclasses
 from pathlib import Path
-import sys
 
 import numpy as np
 import torch
 from torch import nn
-from torch import optim
 import gymnasium as gym
 
-sys.path.append('/data/Prog/PycharmProjects/grund')
 from grund.reskiv.environment import Reskiv, ReskivConfig
 
-from minippo.agent import PPO
+from minippo.agent import PPO, ActorCritic, ActorCriticOutput
 from minippo.execution import train, plot
+from minippo.util import make_mlp
 
 
 class ObservationTransform(gym.ObservationWrapper):
@@ -24,82 +21,86 @@ class ObservationTransform(gym.ObservationWrapper):
         self.env = env
         self.canvas = np.zeros((max_len, 3), dtype=np.float32)
         self._observation_space = gym.spaces.Box(
-            low=np.array(max_len*[[-2.0, -2.0, 0]]),
-            high=np.array(max_len*[[2.0, 2.0, 2.0]]),
+            low=np.array(max_len*[[0.0, 0.0, 0.0]], dtype=np.float32),
+            high=np.array(max_len*[[1.0, 1.0, 3.0]], dtype=np.float32),
             shape=(max_len, 3),
             dtype=np.float32,
         )
 
     def observation(self, obs: np.ndarray) -> np.ndarray:
         assert obs.ndim == 2  # [n_obj, 3: x, y, type]
-        num_enemies = len(obs) - 2
+        obs = obs[:self.max_len]
+        num_entities = len(obs)
+        obs[..., 2] += 1  # shift the type indicator to house the "padding" type.
         self.canvas[:] = 0
-        normed_coords = obs[1:, :2] - obs[:1, :2]  # relative to self, [n_obj - 1, 2]
-        self.canvas[0, :2] = normed_coords[0]  # set the goal object's coords (x, y)
-        self.canvas[0, 2] = 1  # set the goal object's type
-        self.canvas[1:num_enemies+1, :2] = normed_coords[1:, :2][
-            np.argsort(np.linalg.norm(normed_coords[1:, :2], axis=1))
-        ][:self.max_len-1]  # set the enemy objects' coords
-        self.canvas[1:num_enemies+1, 2] = 2  # set the types
+        self.canvas[:num_entities] = obs
         return self.canvas
 
 
-class DeepSet(nn.Module):
+class DeepSet(ActorCritic):
     def __init__(
         self,
         obs_shape: tuple[int, ...],
         proj_hiddens: tuple[int, ...],
         output_hiddens: tuple[int, ...],
-        output_shape: int,
+        n_actor_outputs: int,
+        n_critic_outputs: int = 1,
     ) -> None:
         super().__init__()
         assert len(obs_shape) == 3
-        fan_in = obs_shape[-1]
-        proj_mlp_layers = [
-            nn.Linear(fan_in, proj_hiddens[0]),
-            nn.ReLU(),
-            nn.BatchNorm1d(proj_hiddens[0]),
-        ]
-        h0 = proj_hiddens[0]
-        for h1 in proj_hiddens[1:]:
-            proj_mlp_layers.append(nn.Linear(h0, h1))
-            proj_mlp_layers.append(nn.ReLU())
-            proj_mlp_layers.append(nn.BatchNorm1d(h1))
-            h0 = h1
-        output_layers = [
-            nn.Linear(h0*2, output_hiddens[0]),
-            nn.ReLU(),
-            nn.BatchNorm1d(output_hiddens[0]),
-        ]
-        h0 = output_hiddens[0]
-        for h1 in output_hiddens[1:]:
-            output_layers.append(nn.Linear(h0, h1))
-            output_layers.append(nn.ReLU())
-            output_layers.append(nn.BatchNorm1d(h1))
-            h0 = h1
-        output_layers.append(nn.Linear(h0, output_shape))
+        fan_in = 2
+        self.backbone = make_mlp(fan_in, proj_hiddens[:-1], fan_out=proj_hiddens[-1])
+        h0 = proj_hiddens[-1]*2 + 2 + 2  #  encoded past + encoded present + self xy + target xy
+        self.actor = make_mlp(h0, output_hiddens, n_actor_outputs)
+        self.critic = make_mlp(h0, output_hiddens, n_critic_outputs)
 
-        self.proj_mlp_past = nn.Sequential(*proj_mlp_layers)
-        self.proj_mlp_present = nn.Sequential(*copy.deepcopy(proj_mlp_layers))
-        self.output_mlp = nn.Sequential(*output_layers)
+    def forward_backbone(self, x: torch.Tensor) -> torch.Tensor:
+        *indep_dims, n_frame, n_obj, fan_in = x.shape
+        past, present = x[..., 0, :, :], x[..., 1, :, :]
+        n_enemy = n_obj - 2
+        past_enemy = past[..., 2:, :]  # [*indep, n_enemy, 2]
+        present_enemy = present[..., 2:, :]  # [*indep, n_enemy, 2]
+        active_enemy_past = (past_enemy[..., 2] > 0).float().unsqueeze(-1)  # [*indep, n_enemy, 1]
+        active_enemy_present = (present_enemy[..., 2] > 0).float().unsqueeze(-1)  # [*indep, n_enemy, 1]
+        view_enemy_past = self.backbone(past_enemy[..., :2].reshape(-1, 2)).view(*indep_dims, n_enemy, -1)
+        view_enemy_present = self.backbone(present_enemy[..., :2].reshape(-1, 2)).view(*indep_dims, n_enemy, -1)
+        views = torch.cat([
+            present[..., 0, :2],  # self in present: [*indep, 2]
+            present[..., 1, :2],  # goal in present: [*indep, 2]
+            (view_enemy_past * active_enemy_past).mean(dim=-2),  # [*indep, d]
+            (view_enemy_present * active_enemy_present).mean(dim=-2),  # [*indep, d]
+        ], dim=-1)  # [*indep, d*2 + 4]
+        return views
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, n_env, n_frame, n_obj, fan_in = x.shape
-        past, present = x[:, :, 0].reshape(-1, fan_in), x[:, :, 1].reshape(-1, fan_in)
-        view_past = self.proj_mlp_past(past).view(b*n_env, n_obj, -1)
-        view_present = self.proj_mlp_present(present).view(b*n_env, n_obj, -1)
-        views = torch.cat([view_past.mean(dim=-2), view_present.mean(dim=-2)], dim=-1)
-        fan_in = views.shape[-1]
-        out = self.output_mlp(views.view(-1, fan_in)).view(b, n_env, -1)
-        return out
+    def forward(self, x: torch.Tensor) -> ActorCriticOutput:
+        *indep_dims, n_frame, n_obj, fan_in = x.shape
+        encoded_obs = self.forward_backbone(x)
+        fan_in = encoded_obs.shape[-1]
+        encoded_obs = encoded_obs.view(-1, fan_in)
+        action_logit = self.actor(encoded_obs).view(*indep_dims, -1)
+        value = self.critic(encoded_obs).view(*indep_dims, -1)
+        return ActorCriticOutput(action_logit, value)
+
 
 
 def env_fn(**kwargs):
-    maxlen = 20
-    framestack = 2
-    env = Reskiv(ReskivConfig(observation_type="coords", time_limit=1000))
+    env_config = {
+        "canvas_shape": (320, 320),
+        "observation_type": "coords",
+        "time_limit": 1000,
+        "step_penalty": -0.1,
+        "enemy_pad_length": 15,
+        "frame_stack": 2,
+        "reward_scaler": 0.1,
+    }
+    env_config.update(kwargs)
+    maxlen = env_config.pop("enemy_pad_length")
+    framestack = env_config.pop("frame_stack")
+    rwd_scale = env_config.pop("reward_scaler")
+    env = Reskiv(ReskivConfig(**env_config))
     env = ObservationTransform(env, max_len=maxlen)
     env = gym.wrappers.FrameStackObservation(env, stack_size=framestack)
+    env = gym.wrappers.TransformReward(env, lambda r: r * rwd_scale)
     return env
 
 
@@ -109,11 +110,13 @@ class AgentHPs:
     action_shape: int
     gamma: float
     lam: float
-    ent_coef: float
     actor_hiddens: tuple[int, ...]
     critic_hiddens: tuple[int, ...]
-    actor_lr: float
-    critic_lr: float
+    actor_critic_lr: float
+    actor_loss_coef: float
+    critic_loss_coef: float
+    entropy_loss_coef: float
+    clip_grad_norm: float
     ppo_batch_size: int
     ppo_max_updates: int
     ppo_clip_ratio: float
@@ -126,24 +129,26 @@ agent_hps = AgentHPs(
     action_shape=env.action_space.n,
     gamma=0.99,
     lam=0.95,  # hyperparameter for GAE
-    ent_coef=0.01,  # coefficient for the entropy bonus (to encourage exploration)
     actor_hiddens=(32, 32),
     critic_hiddens=(32, 32),
-    actor_lr=1e-4,  # 0.0001
-    critic_lr=3e-4,  # 0.0005
+    actor_critic_lr=3e-4,
+    actor_loss_coef=1.0,
+    critic_loss_coef=3.0,
+    entropy_loss_coef=0.001,  # coefficient for the entropy bonus (to encourage exploration)
+    clip_grad_norm=1.0,
     ppo_batch_size=32,
-    ppo_max_updates=5*(128*16),
+    ppo_max_updates=64,
     ppo_clip_ratio=0.2,
 )
 
 training_hps = dict(
     obs_shape=env.observation_space.shape,
     action_shape=env.action_space.n,
-    n_envs=16,
-    n_updates=1000,
+    n_envs=32,
+    n_updates=5000,
     n_steps_per_update=128,
     num_eval_rollouts=1,
-    report_smoothing_window=10,
+    report_smoothing_window=50,
 )
 
 # set the device
@@ -154,31 +159,34 @@ else:
     device = torch.device("cpu")
 
 
-def tanitas():
-
-    # init the agent
-    actor = DeepSet(
+def _agent_fn():
+    actor_critic = DeepSet(
         obs_shape=agent_hps.obs_shape,
         proj_hiddens=agent_hps.actor_hiddens,
         output_hiddens=agent_hps.actor_hiddens,
-        output_shape=agent_hps.action_shape,
+        n_actor_outputs=agent_hps.action_shape,
     )
-    critic = DeepSet(
-        obs_shape=agent_hps.obs_shape,
-        proj_hiddens=agent_hps.critic_hiddens,
-        output_hiddens=agent_hps.critic_hiddens,
-        output_shape=1,
-    )
-    agent = PPO(
+    return PPO(
         device,
         dataclasses.asdict(agent_hps),
-        actor_fn=lambda: actor,
-        critic_fn=lambda: critic,
-        actor_optim_fn=lambda: torch.optim.Adam(actor.parameters(), lr=agent_hps.actor_lr),
-        critic_optim_fn=lambda: torch.optim.Adam(critic.parameters(), lr=agent_hps.critic_lr),
+        actor_critic_fn=lambda: actor_critic,
+        actor_critic_optim_fn=lambda: torch.optim.Adam(actor_critic.parameters(), lr=agent_hps.actor_critic_lr),
     )
+
+
+LOGS_ROOT = Path("logs/PPO-Reskiv")
+CHKP_ROOT = Path("checkpoints/PPO-Reskiv")
+LATEST_CHKP = CHKP_ROOT / "latest_agent.pt"
+BEST_CHKP = CHKP_ROOT / "best_agent.pt"
+
+
+def learn():
+    agent = _agent_fn()
+    env_config = {
+        "step_penalty": -0.01,
+    }
     train_envs = gym.vector.SyncVectorEnv(
-        env_fns=[env_fn for _ in range(training_hps["n_envs"])],
+        env_fns=[lambda: env_fn(**env_config) for _ in range(training_hps["n_envs"])],
         autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,
     )
     train(
@@ -186,17 +194,16 @@ def tanitas():
         agent,
         train_envs,
         eval_env=env_fn(),
-        log_root=Path(f"logs/{agent.__class__.__name__}-Reskiv"),
-        checkpoints_root = Path(f"checkpoints/{agent.__class__.__name__}-Reskiv"),
+        log_root=LOGS_ROOT,
+        checkpoints_root=CHKP_ROOT,
     )
 
 
-def megnezes():
-    agent = PPO(device, agent_hps)
-    agent.load(Path(f"checkpoints/{agent.__class__.__name__}-Reskiv/best_agent.pt"))
-    plot(agent, env=env_fn(render_mode="human"))
-
+def watch():
+    agent = _agent_fn()
+    agent.load(BEST_CHKP)
+    plot(agent, env=env_fn(), temperature=0.75)
 
 
 if __name__ == "__main__":
-    tanitas()
+    learn()
